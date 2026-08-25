@@ -234,19 +234,25 @@ your specific token, rather than guessing. (Every fetch already prints
 HubSpot's overall reported `total` on its first page too, regardless of
 this flag.)
 
-**Confirmed exception — Brand isn't filtered server-side.** Using
-`DEBUG_FETCH_FILTERS=1` against a real Service Key, the count collapsed
-specifically when adding the Brand filter (`hs_all_assigned_business_unit_ids
-CONTAINS_TOKEN`) — 21,616 → 37, instead of the ~13,617 a full-access
-credential returns for the same filter. The property's own definition was
-confirmed correct (value `"0"` = "Global Citizen Solutions", 101,410
-contacts portal-wide) — this is HubSpot's Business Units feature
-restricting a credential's ability to *filter* on that property via the
-Search API, separate from ordinary CRM scopes, not a bug in the property
-mapping. Brand is therefore excluded from the server-side search
-entirely and left to `apply_overall_filters()`'s client-side check
-(`_has_brand_value()`), which reads the value from each contact's normal
-properties instead of asking the search index to filter on it. This
-costs a somewhat larger contact fetch (Brand no longer narrows server-side)
-in exchange for correctness regardless of a token's Business Units
-filtering access.
+**A Business Units quirk in Step 0's Brand resolution.**
+`hs_all_assigned_business_unit_ids` (the property backing HubSpot's
+Business Units/Brands feature) is declared with `"externalOptions": true`
+on `GET /crm/v3/properties/contacts/hs_all_assigned_business_unit_ids` —
+HubSpot's signal that this property's valid option list (id ↔ brand name)
+is *not* embedded in the Properties API response at all; its `options`
+array always comes back `[]`, for every credential. Step 0's Brand
+resolution originally required a populated `options` match, so it always
+fell through to the wrong property (`client_x_brand`, ~0.06% populated) —
+which for a while looked like a credential-side Business Units filtering
+restriction (a `DEBUG_FETCH_FILTERS=1` run showed the count collapsing
+21,616 → 37 specifically on the Brand filter), but that was actually just
+`client_x_brand`'s own near-empty population being tested, not a real
+restriction. `hs_all_assigned_business_unit_ids` is now special-cased in
+`resolve_reference_data()`: once resolved by name, its required value
+comes from a small hardcoded `BUSINESS_UNIT_LABEL_TO_ID` map (sourced
+from the portal's own Business Units search-options UI) instead of the
+property's own — always-empty — `options`. Brand filters server-side
+again like the other 3 overall filters (still re-checked client-side too,
+as the authoritative pass). If a business unit is ever renamed or a new
+one added, `resolve_reference_data()` raises `HubSpotError` rather than
+silently using a stale id — update the map in that case.

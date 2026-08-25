@@ -138,6 +138,30 @@ LEAD_SOURCE_EXCLUDE_LABELS = ["Bundle Offer", "Other", "Instantly", "Private", "
 BRAND_REQUIRED_LABEL = "Global Citizen Solutions"
 BRAND_DOMAIN_EXCLUDE_LABELS = ["BePortugal"]
 
+# hs_all_assigned_business_unit_ids (the "Brands" property backing HubSpot's
+# Business Units feature) is declared with "externalOptions": true on
+# GET /crm/v3/properties/contacts/hs_all_assigned_business_unit_ids -- this
+# is HubSpot's signal that the property's valid option list is NOT embedded
+# in the Properties API response (its "options" array is always []); the
+# real id<->label mapping lives in a separate Business Units API instead.
+# That's true for every credential (Service Key, Private App, admin --
+# confirmed against the live portal), not a permissions quirk of any one
+# token. The dedicated Business Units API
+# (GET /business-units/v3/business-units/user/{userId}) would be the
+# "proper" way to resolve this, but it needs the business_units_view.read
+# scope (not granted here) and is a per-user lookup with no account-wide
+# "list all brands" endpoint -- not a good fit for a script that otherwise
+# resolves everything dynamically. So this one mapping is hardcoded,
+# sourced directly from the portal's own Business Units search-options UI
+# (Label / Internal name / value, confirmed live): if a business unit is
+# ever renamed or a new one added, resolve_reference_data() below still
+# raises HubSpotError rather than silently using a stale id.
+BUSINESS_UNIT_LABEL_TO_ID = {
+    "Global Citizen Solutions": "0",
+    "Get NIF Portugal": "18346255",
+    "Goldcrest": "18395897",
+}
+
 
 # =========================================================================
 # Date / calendar helpers
@@ -486,13 +510,21 @@ def resolve_reference_data(client: HubSpotClient) -> ReferenceData:
     # required option, and only fall back to the old generic scan -- which
     # is one property-population check away from repeating the same
     # mistake -- as a last resort.
+    #
+    # IMPORTANT: hs_all_assigned_business_unit_ids is declared with
+    # "externalOptions": true -- its "options" array from the Properties
+    # API is ALWAYS empty (confirmed live, GET
+    # /crm/v3/properties/contacts/hs_all_assigned_business_unit_ids),
+    # regardless of credential. So it can never be matched via the normal
+    # "does this property's options contain the required label" check used
+    # for every other property below -- if we required that, we'd always
+    # fall through to the wrong "Client x Brand" property. It's special-
+    # cased: once resolved by name, its required value comes from the
+    # hardcoded BUSINESS_UNIT_LABEL_TO_ID map (see its definition for why).
     brand_prop = _by_label(contact_props, "Brand")
     if brand_prop is None:
         brand_prop = contact_props_by_name.get("hs_all_assigned_business_unit_ids")
-        if brand_prop and not any(
-            (o.get("label") or "").strip() == BRAND_REQUIRED_LABEL for o in brand_prop.get("options", [])
-        ):
-            brand_prop = None
+    business_unit_brand = brand_prop is not None and brand_prop["name"] == "hs_all_assigned_business_unit_ids"
     if brand_prop is None:
         candidates = [p for p in contact_props if p.get("type") == "enumeration"
                       and any((o.get("label") or "").strip() == BRAND_REQUIRED_LABEL for o in p.get("options", []))]
@@ -505,9 +537,18 @@ def resolve_reference_data(client: HubSpotClient) -> ReferenceData:
                f"Brand section for why this one and not another 'brand-ish' candidate.")
         print(f"  {msg}")
         flags.append(msg)
-    brand_values = _match_option_values(brand_prop, [BRAND_REQUIRED_LABEL], flags)
-    if BRAND_REQUIRED_LABEL not in brand_values:
-        raise HubSpotError(f"Resolved Brand property '{brand_prop['name']}' has no option '{BRAND_REQUIRED_LABEL}'.")
+    if business_unit_brand:
+        required_value = BUSINESS_UNIT_LABEL_TO_ID.get(BRAND_REQUIRED_LABEL)
+        if required_value is None:
+            raise HubSpotError(
+                f"BUSINESS_UNIT_LABEL_TO_ID has no entry for '{BRAND_REQUIRED_LABEL}' -- a business unit was "
+                f"likely renamed or removed; update the hardcoded map (see its definition for why it's hardcoded)."
+            )
+        brand_values = {BRAND_REQUIRED_LABEL: required_value}
+    else:
+        brand_values = _match_option_values(brand_prop, [BRAND_REQUIRED_LABEL], flags)
+        if BRAND_REQUIRED_LABEL not in brand_values:
+            raise HubSpotError(f"Resolved Brand property '{brand_prop['name']}' has no option '{BRAND_REQUIRED_LABEL}'.")
     print(f"  Brand                                = {brand_prop['name']} (label: {brand_prop.get('label')}), "
           f"required value = {brand_values[BRAND_REQUIRED_LABEL]!r} "
           f"(matched as a ';'-separated token, since this property may be multi-valued)")
@@ -638,24 +679,27 @@ def _overall_filter_steps(ref: ReferenceData, cutoff_ms: str) -> list[tuple[str,
     debug_contact_fetch_filters() so the incremental diagnostic tests the
     exact same clauses the real fetch uses, not a re-typed approximation.
 
-    Each entry is (label, clause, server_side). Brand is server_side=False:
-    DEBUG_FETCH_FILTERS on a real run isolated it as the exact point a
-    Service Key's filtered count collapsed (21,616 -> 37, vs. ~13,617
-    expected) while the Contact Type/Lead Source/Brand Domain filters
-    matched expectations -- HubSpot's Business Units feature restricts
-    *filtering* on hs_all_assigned_business_unit_ids per-credential,
-    separately from ordinary CRM read scopes (confirmed the property's own
-    definition is correct: value "0" = "Global Citizen Solutions",
-    101,410 contacts portal-wide). So Brand is excluded from the
-    server-side search and left entirely to apply_overall_filters()'s
-    client-side check via _has_brand_value(), which reads the value from
-    each contact's normal properties payload instead of asking the search
-    index to filter on it. It stays in this list (server_side=False) so
-    the diagnostic can still show the drop when explicitly testing it."""
+    Each entry is (label, clause, server_side). Brand was previously
+    server_side=False, based on an earlier DEBUG_FETCH_FILTERS run that
+    showed the filtered count collapsing (21,616 -> 37 for Brand, vs.
+    ~13,617 expected). That diagnosis turned out to be a red herring: at
+    the time, Brand had been mis-resolved to the wrong property
+    (client_x_brand, ~0.06% populated -- see resolve_reference_data's
+    Brand section for why) because hs_all_assigned_business_unit_ids's
+    "options" array is always empty ("externalOptions": true) and the old
+    resolution logic required a populated options match. So that CONTAINS_TOKEN
+    filter was silently testing client_x_brand's own (near-empty)
+    population the whole time, not a real Business Units filtering
+    restriction on any credential. Now that Brand resolves correctly,
+    Brand is server_side=True like the other 3 filters -- narrowing the
+    search server-side is strictly better (fewer results paginated,
+    less risk of hitting the Search API's 10,000-result cap).
+    apply_overall_filters() still re-applies it client-side too, as the
+    authoritative pass this whole function's docstring already promises."""
     return [
         ("createdate cutoff", {"propertyName": "createdate", "operator": "GTE", "value": cutoff_ms}, True),
         ("+ Brand (required)", {"propertyName": ref.brand_prop, "operator": "CONTAINS_TOKEN",
-                                 "value": ref.brand_required_value}, False),
+                                 "value": ref.brand_required_value}, True),
         ("+ Contact Type (exclude)", {"propertyName": ref.contact_type_prop, "operator": "NOT_IN",
                                        "values": list(ref.contact_type_exclude_values.values())}, True),
         ("+ Lead Source (exclude)", {"propertyName": ref.lead_source_prop, "operator": "NOT_IN",
