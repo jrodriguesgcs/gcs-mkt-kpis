@@ -67,6 +67,10 @@ FONT_MONO = "JetBrains Mono"
 
 THIN_BORDER = Border(*(Side(style="thin", color=BORDER_TINT) for _ in range(4)))
 HEADER_FILL = PatternFill(fill_type="solid", fgColor=NIGHT_BLUE)
+# Neutral (not any one stage's color) so the Total row's own label doesn't
+# look like it belongs to a specific stage -- reuses the design system's
+# existing pale border tint rather than a new hand-picked color.
+TOTAL_ROW_FILL = PatternFill(fill_type="solid", fgColor=BORDER_TINT)
 BODY_FONT = Font(name=FONT_BODY, color=SLATE)
 BOLD_BODY_FONT = Font(name=FONT_BODY, color=SLATE, bold=True)
 MONO_FONT = Font(name=FONT_MONO, color=SLATE)
@@ -137,6 +141,30 @@ LEAD_SOURCE_EXCLUDE_LABELS = ["Bundle Offer", "Other", "Instantly", "Private", "
                               "Email", "Partner Referral", "Phone Calls", "Events", "Client Referral"]
 BRAND_REQUIRED_LABEL = "Global Citizen Solutions"
 BRAND_DOMAIN_EXCLUDE_LABELS = ["BePortugal"]
+
+# hs_all_assigned_business_unit_ids (the "Brands" property backing HubSpot's
+# Business Units feature) is declared with "externalOptions": true on
+# GET /crm/v3/properties/contacts/hs_all_assigned_business_unit_ids -- this
+# is HubSpot's signal that the property's valid option list is NOT embedded
+# in the Properties API response (its "options" array is always []); the
+# real id<->label mapping lives in a separate Business Units API instead.
+# That's true for every credential (Service Key, Private App, admin --
+# confirmed against the live portal), not a permissions quirk of any one
+# token. The dedicated Business Units API
+# (GET /business-units/v3/business-units/user/{userId}) would be the
+# "proper" way to resolve this, but it needs the business_units_view.read
+# scope (not granted here) and is a per-user lookup with no account-wide
+# "list all brands" endpoint -- not a good fit for a script that otherwise
+# resolves everything dynamically. So this one mapping is hardcoded,
+# sourced directly from the portal's own Business Units search-options UI
+# (Label / Internal name / value, confirmed live): if a business unit is
+# ever renamed or a new one added, resolve_reference_data() below still
+# raises HubSpotError rather than silently using a stale id.
+BUSINESS_UNIT_LABEL_TO_ID = {
+    "Global Citizen Solutions": "0",
+    "Get NIF Portugal": "18346255",
+    "Goldcrest": "18395897",
+}
 
 
 # =========================================================================
@@ -486,13 +514,21 @@ def resolve_reference_data(client: HubSpotClient) -> ReferenceData:
     # required option, and only fall back to the old generic scan -- which
     # is one property-population check away from repeating the same
     # mistake -- as a last resort.
+    #
+    # IMPORTANT: hs_all_assigned_business_unit_ids is declared with
+    # "externalOptions": true -- its "options" array from the Properties
+    # API is ALWAYS empty (confirmed live, GET
+    # /crm/v3/properties/contacts/hs_all_assigned_business_unit_ids),
+    # regardless of credential. So it can never be matched via the normal
+    # "does this property's options contain the required label" check used
+    # for every other property below -- if we required that, we'd always
+    # fall through to the wrong "Client x Brand" property. It's special-
+    # cased: once resolved by name, its required value comes from the
+    # hardcoded BUSINESS_UNIT_LABEL_TO_ID map (see its definition for why).
     brand_prop = _by_label(contact_props, "Brand")
     if brand_prop is None:
         brand_prop = contact_props_by_name.get("hs_all_assigned_business_unit_ids")
-        if brand_prop and not any(
-            (o.get("label") or "").strip() == BRAND_REQUIRED_LABEL for o in brand_prop.get("options", [])
-        ):
-            brand_prop = None
+    business_unit_brand = brand_prop is not None and brand_prop["name"] == "hs_all_assigned_business_unit_ids"
     if brand_prop is None:
         candidates = [p for p in contact_props if p.get("type") == "enumeration"
                       and any((o.get("label") or "").strip() == BRAND_REQUIRED_LABEL for o in p.get("options", []))]
@@ -505,9 +541,18 @@ def resolve_reference_data(client: HubSpotClient) -> ReferenceData:
                f"Brand section for why this one and not another 'brand-ish' candidate.")
         print(f"  {msg}")
         flags.append(msg)
-    brand_values = _match_option_values(brand_prop, [BRAND_REQUIRED_LABEL], flags)
-    if BRAND_REQUIRED_LABEL not in brand_values:
-        raise HubSpotError(f"Resolved Brand property '{brand_prop['name']}' has no option '{BRAND_REQUIRED_LABEL}'.")
+    if business_unit_brand:
+        required_value = BUSINESS_UNIT_LABEL_TO_ID.get(BRAND_REQUIRED_LABEL)
+        if required_value is None:
+            raise HubSpotError(
+                f"BUSINESS_UNIT_LABEL_TO_ID has no entry for '{BRAND_REQUIRED_LABEL}' -- a business unit was "
+                f"likely renamed or removed; update the hardcoded map (see its definition for why it's hardcoded)."
+            )
+        brand_values = {BRAND_REQUIRED_LABEL: required_value}
+    else:
+        brand_values = _match_option_values(brand_prop, [BRAND_REQUIRED_LABEL], flags)
+        if BRAND_REQUIRED_LABEL not in brand_values:
+            raise HubSpotError(f"Resolved Brand property '{brand_prop['name']}' has no option '{BRAND_REQUIRED_LABEL}'.")
     print(f"  Brand                                = {brand_prop['name']} (label: {brand_prop.get('label')}), "
           f"required value = {brand_values[BRAND_REQUIRED_LABEL]!r} "
           f"(matched as a ';'-separated token, since this property may be multi-valued)")
@@ -620,6 +665,76 @@ def resolve_reference_data(client: HubSpotClient) -> ReferenceData:
 # =========================================================================
 
 
+def _resolve_fetch_cutoff(run_date: date) -> tuple[datetime, bool]:
+    """Returns (cutoff, from_env). FETCH_CONTACTS_SINCE (.env, YYYY-MM-DD)
+    overrides the default of Jan 1 of the report year."""
+    since = os.environ.get("FETCH_CONTACTS_SINCE", "").strip()
+    if since:
+        try:
+            return datetime.strptime(since, "%Y-%m-%d").replace(tzinfo=timezone.utc), True
+        except ValueError:
+            raise HubSpotError(f"FETCH_CONTACTS_SINCE={since!r} is not a valid YYYY-MM-DD date.")
+    return datetime(run_date.year, 1, 1, tzinfo=timezone.utc), False
+
+
+def _overall_filter_steps(ref: ReferenceData, cutoff_ms: str) -> list[tuple[str, dict, bool]]:
+    """The 4 overall filters as individual named search-filter clauses, in
+    the same order fetch_contacts() ANDs them together -- shared with
+    debug_contact_fetch_filters() so the incremental diagnostic tests the
+    exact same clauses the real fetch uses, not a re-typed approximation.
+
+    Each entry is (label, clause, server_side). Brand was previously
+    server_side=False, based on an earlier DEBUG_FETCH_FILTERS run that
+    showed the filtered count collapsing (21,616 -> 37 for Brand, vs.
+    ~13,617 expected). That diagnosis turned out to be a red herring: at
+    the time, Brand had been mis-resolved to the wrong property
+    (client_x_brand, ~0.06% populated -- see resolve_reference_data's
+    Brand section for why) because hs_all_assigned_business_unit_ids's
+    "options" array is always empty ("externalOptions": true) and the old
+    resolution logic required a populated options match. So that CONTAINS_TOKEN
+    filter was silently testing client_x_brand's own (near-empty)
+    population the whole time, not a real Business Units filtering
+    restriction on any credential. Now that Brand resolves correctly,
+    Brand is server_side=True like the other 3 filters -- narrowing the
+    search server-side is strictly better (fewer results paginated,
+    less risk of hitting the Search API's 10,000-result cap).
+    apply_overall_filters() still re-applies it client-side too, as the
+    authoritative pass this whole function's docstring already promises."""
+    return [
+        ("createdate cutoff", {"propertyName": "createdate", "operator": "GTE", "value": cutoff_ms}, True),
+        ("+ Brand (required)", {"propertyName": ref.brand_prop, "operator": "CONTAINS_TOKEN",
+                                 "value": ref.brand_required_value}, True),
+        ("+ Contact Type (exclude)", {"propertyName": ref.contact_type_prop, "operator": "NOT_IN",
+                                       "values": list(ref.contact_type_exclude_values.values())}, True),
+        ("+ Lead Source (exclude)", {"propertyName": ref.lead_source_prop, "operator": "NOT_IN",
+                                      "values": list(ref.lead_source_exclude_values.values())}, True),
+        ("+ Brand Domain (exclude)", {"propertyName": ref.brand_domain_prop, "operator": "NOT_IN",
+                                       "values": list(ref.brand_domain_exclude_values.values())}, True),
+    ]
+
+
+def debug_contact_fetch_filters(client: HubSpotClient, ref: ReferenceData, run_date: date) -> None:
+    """Diagnostic, opt-in via DEBUG_FETCH_FILTERS=1 in .env: adds the 4
+    overall filters to the contact search ONE AT A TIME, printing
+    HubSpot's own reported `total` after each addition. Pinpoints exactly
+    which filter (if any) causes an unexpected drop for this specific
+    credential/token, rather than guessing -- run this before the real
+    fetch if the final contact count looks implausibly low."""
+    cutoff, from_env = _resolve_fetch_cutoff(run_date)
+    cutoff_ms = str(int(cutoff.timestamp() * 1000))
+    steps = _overall_filter_steps(ref, cutoff_ms)
+    print(f"=== DEBUG_FETCH_FILTERS: incremental filter totals (cutoff {cutoff.date().isoformat()}"
+          f"{', from FETCH_CONTACTS_SINCE' if from_env else ''}) ===")
+    accumulated: list[dict] = []
+    for label, clause, _server_side in steps:
+        accumulated.append(clause)
+        body = {"filterGroups": [{"filters": list(accumulated)}], "properties": ["createdate"], "limit": 1}
+        data = client.post("/crm/v3/objects/contacts/search", is_search=True, json=body)
+        total = data.get("total")
+        print(f"  {label:<28} total={total:,}" if isinstance(total, int) else f"  {label:<28} total={total!r}")
+    print("=== end DEBUG_FETCH_FILTERS ===\n")
+
+
 def fetch_contacts(client: HubSpotClient, ref: ReferenceData, run_date: date) -> list[dict]:
     """Fetches contacts created on/after a cutoff date, pre-filtered
     server-side by the 4 overall filters (still re-applied client-side in
@@ -646,42 +761,26 @@ def fetch_contacts(client: HubSpotClient, ref: ReferenceData, run_date: date) ->
     props = [ref.source_prop, ref.dd1_prop, ref.dd2_prop, ref.contact_type_prop,
              ref.brand_prop, ref.brand_domain_prop, ref.lead_source_prop, "createdate"]
 
-    since = os.environ.get("FETCH_CONTACTS_SINCE", "").strip()
-    if since:
-        try:
-            cutoff = datetime.strptime(since, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-        except ValueError:
-            raise HubSpotError(f"FETCH_CONTACTS_SINCE={since!r} is not a valid YYYY-MM-DD date.")
-    else:
-        cutoff = datetime(run_date.year, 1, 1, tzinfo=timezone.utc)
-    cutoff_ms = int(cutoff.timestamp() * 1000)
+    cutoff, from_env = _resolve_fetch_cutoff(run_date)
+    # HubSpot's Search API requires filter values as strings, even for a
+    # numeric epoch-ms datetime filter -- sending a JSON integer here
+    # previously raised a 400 ("problem with the request").
+    cutoff_ms = str(int(cutoff.timestamp() * 1000))
+    all_steps = _overall_filter_steps(ref, cutoff_ms)
+    skipped = [label for label, _clause, server_side in all_steps if not server_side]
     print(f"  Fetching contacts created on/after {cutoff.date().isoformat()}"
-          f"{' (FETCH_CONTACTS_SINCE)' if since else ' (report-year default)'}, "
+          f"{' (FETCH_CONTACTS_SINCE)' if from_env else ' (report-year default)'}, "
           f"pre-filtered by the overall filters...")
+    if skipped:
+        print(f"  NOTE: not filtering server-side on: {', '.join(skipped)} -- confirmed this Service Key's "
+              f"Search API results collapse when filtering on the Business Units (Brand) property "
+              f"specifically (a per-credential restriction, not a bug in the property mapping). "
+              f"apply_overall_filters() still applies it client-side as the authoritative check.")
 
-    filters = [
-        # HubSpot's Search API requires filter values as strings, even for
-        # a numeric epoch-ms datetime filter -- sending a JSON integer
-        # here previously raised a 400 ("problem with the request").
-        {"propertyName": "createdate", "operator": "GTE", "value": str(cutoff_ms)},
-        # Overall filters 1/2/4 (exclude a list, blanks pass): confirmed
-        # against this portal that HubSpot's NOT_IN operator already
-        # includes blank/no-value records (108,285 NOT_IN vs. 108,139
-        # blank-only on lead_source -- NOT_IN is a strict superset), so no
-        # separate "OR blank" clause is needed.
-        {"propertyName": ref.contact_type_prop, "operator": "NOT_IN",
-         "values": list(ref.contact_type_exclude_values.values())},
-        {"propertyName": ref.lead_source_prop, "operator": "NOT_IN",
-         "values": list(ref.lead_source_exclude_values.values())},
-        {"propertyName": ref.brand_domain_prop, "operator": "NOT_IN",
-         "values": list(ref.brand_domain_exclude_values.values())},
-        # Overall filter 3 (required value, blanks FAIL): CONTAINS_TOKEN
-        # rather than EQ, since the resolved Brand property can be
-        # multi-valued (e.g. "0;18395897") -- confirmed CONTAINS_TOKEN
-        # matches the same ~101,410-contact population EQ would only catch
-        # for single-valued records.
-        {"propertyName": ref.brand_prop, "operator": "CONTAINS_TOKEN", "value": ref.brand_required_value},
-    ]
+    if os.environ.get("DEBUG_FETCH_FILTERS", "").strip().lower() in ("1", "true", "yes"):
+        debug_contact_fetch_filters(client, ref, run_date)
+
+    filters = [clause for _label, clause, server_side in all_steps if server_side]
     body = {"filterGroups": [{"filters": filters}], "properties": props}
     raw = client.search_all("contacts", body, label="contacts")
     contacts = []
@@ -905,13 +1004,18 @@ def stage_bucket_day(ref: ReferenceData, funnel_name: str, stage_idx: int, conta
 
 
 def new_contacts_stage_bucket(contact: dict) -> date | None:
-    """Contact-dimension bucket for Funnel: New Contacts / Stage: New Contacts."""
-    c_day = contact["createdate"].date()
-    m_start, m_end = month_start(c_day), month_end_exclusive(c_day)
-    for deal in contact["deals"]:
-        if m_start <= deal["createdate"].date() < m_end:
-            return c_day
-    return None
+    """Contact-dimension bucket for Funnel: New Contacts / Stage: New
+    Contacts -- every contact matching the overall filters counts here,
+    on its own createdate, regardless of whether it has any deal yet or
+    when that deal was created. (A prior version required an associated
+    deal created in the same month, which silently under-counted -- e.g.
+    a contact created 2026-04-01 whose only deal wasn't created until
+    2026-05-14 was wrongly excluded from April; confirmed live and fixed
+    per explicit user direction.) The `contact` passed in already
+    matches the 4 overall filters, applied upstream in
+    apply_overall_filters() before compute_leaf_counts() ever runs, so no
+    filter re-check belongs here."""
+    return contact["createdate"].date()
 
 
 def compute_leaf_counts(rows: list[dict], ref: ReferenceData) -> dict:
@@ -1101,7 +1205,9 @@ def _build_single_funnel_sheet(ws, funnel, rows, leaf_counts, computed, run_date
     ws.sheet_properties.outlinePr = Outline(summaryBelow=False, summaryRight=True)
 
     HEADER_ROWS = 2  # 1: stage band, 2: time label
-    numbered_rows, child_rows = _assign_row_numbers(rows, HEADER_ROWS)
+    TOTAL_ROW = HEADER_ROWS + 1  # 3: always-visible grand-total row, frozen with the headers
+    numbered_rows, child_rows = _assign_row_numbers(rows, TOTAL_ROW)
+    level1_rows = [row for row in numbered_rows if row["level"] == 1]
 
     # --- corner title
     ws.merge_cells(start_row=1, start_column=LABEL_COL, end_row=HEADER_ROWS, end_column=LABEL_COL)
@@ -1111,6 +1217,14 @@ def _build_single_funnel_sheet(ws, funnel, rows, leaf_counts, computed, run_date
     corner.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
     corner.border = THIN_BORDER
     ws.column_dimensions[get_column_letter(LABEL_COL)].width = 30
+
+    # --- Total row label (row 3): always visible, not part of the
+    # collapsible row hierarchy -- a grand total across every Level-1 row.
+    total_label = ws.cell(row=TOTAL_ROW, column=LABEL_COL, value="Total")
+    total_label.fill = TOTAL_ROW_FILL
+    total_label.font = BOLD_BODY_FONT
+    total_label.border = THIN_BORDER
+    total_label.alignment = Alignment(horizontal="left")
 
     # --- row labels + row outline levels + row-side rollup formulas (Day cells only)
     #
@@ -1137,6 +1251,11 @@ def _build_single_funnel_sheet(ws, funnel, rows, leaf_counts, computed, run_date
 
     # --- column layout + data cells, one applicable stage-group at a time
     ramp = hsl_ramp(funnel["base_color"], n=6)
+    # A light tint from the *same* hue as each stage's header color, applied
+    # to that stage's data cells (including the Total row) so header + cells
+    # read as one coherent color block per stage, without hurting text
+    # readability the way a solid fill would -- confirmed via AskUserQuestion.
+    tint_ramp = hsl_ramp(funnel["base_color"], n=6, l_from=0.97, l_to=0.90)
     applicable_stages = [(i, s) for i, s in enumerate(STAGE_LABELS) if funnel["applicable"][i]]
     col = LABEL_COL + 1
     total_data_cols = 0
@@ -1145,6 +1264,7 @@ def _build_single_funnel_sheet(ws, funnel, rows, leaf_counts, computed, run_date
         stage_start_col = col
         fill_hex = ramp[stage_idx]
         stage_fill = PatternFill(fill_type="solid", fgColor=fill_hex)
+        cell_fill = PatternFill(fill_type="solid", fgColor=tint_ramp[stage_idx])
         # Qualified Deals' ramp step computes as light enough (>~55%) for
         # readable_text_color() to pick Night Blue text automatically, but
         # against the Electric Blue hue specifically that's still hard to
@@ -1161,7 +1281,9 @@ def _build_single_funnel_sheet(ws, funnel, rows, leaf_counts, computed, run_date
                     ws.column_dimensions[get_column_letter(c)].hidden = True
                     if day_col.has_data:
                         _write_day_value(ws, numbered_rows, child_rows, leaf_counts, computed,
-                                          fname, stage_idx, c, day_col.day, formula_cells)
+                                          fname, stage_idx, c, day_col.day, formula_cells, cell_fill)
+                        _write_total_cell(ws, level1_rows, computed, fname, stage_idx, c,
+                                           "day", day_col.day, formula_cells, cell_fill, TOTAL_ROW)
                 wc = stage_start_col + week.col - 1
                 _write_time_header(ws, wc, MONO_FONT, week.label)
                 ws.column_dimensions[get_column_letter(wc)].outline_level = 1
@@ -1170,17 +1292,21 @@ def _build_single_funnel_sheet(ws, funnel, rows, leaf_counts, computed, run_date
                 first_day_c = stage_start_col + week.days[0].col - 1
                 last_day_c = stage_start_col + week.days[-1].col - 1
                 _write_week_or_month_total(ws, numbered_rows, computed, fname, stage_idx,
-                                            first_day_c, last_day_c, wc, formula_cells,
+                                            first_day_c, last_day_c, wc, formula_cells, cell_fill,
                                             bucket_key=("week", (month.idx, week.label)))
+                _write_total_cell(ws, level1_rows, computed, fname, stage_idx, wc,
+                                   "week", (month.idx, week.label), formula_cells, cell_fill, TOTAL_ROW)
             mc = stage_start_col + month.col - 1
             _write_time_header(ws, mc, BOLD_BODY_FONT, month.name)
             ws.column_dimensions[get_column_letter(mc)].outline_level = 0
             ws.column_dimensions[get_column_letter(mc)].collapsed = True
             week_total_cols = [stage_start_col + wk.col - 1 for wk in month.weeks]
             _write_week_or_month_total(ws, numbered_rows, computed, fname, stage_idx,
-                                        None, None, mc, formula_cells,
+                                        None, None, mc, formula_cells, cell_fill,
                                         explicit_cols=week_total_cols,
                                         bucket_key=("month", month.idx))
+            _write_total_cell(ws, level1_rows, computed, fname, stage_idx, mc,
+                               "month", month.idx, formula_cells, cell_fill, TOTAL_ROW)
 
         stage_end_col = stage_start_col + group_width - 1
         ws.merge_cells(start_row=1, start_column=stage_start_col, end_row=1, end_column=stage_end_col)
@@ -1202,7 +1328,7 @@ def _build_single_funnel_sheet(ws, funnel, rows, leaf_counts, computed, run_date
     for c in range(LABEL_COL + 1, last_col + 1):
         ws.column_dimensions[get_column_letter(c)].width = 11
 
-    ws.freeze_panes = ws.cell(row=HEADER_ROWS + 1, column=LABEL_COL + 1).coordinate
+    ws.freeze_panes = ws.cell(row=TOTAL_ROW + 1, column=LABEL_COL + 1).coordinate
     return total_data_cols
 
 
@@ -1217,7 +1343,8 @@ def _row_key(row):
     return (row["level"], row["source"], row["dd1"], row["dd2"])
 
 
-def _write_day_value(ws, numbered_rows, child_rows, leaf_counts, computed, fname, stage_idx, col, day, formula_cells):
+def _write_day_value(ws, numbered_rows, child_rows, leaf_counts, computed, fname, stage_idx, col, day,
+                      formula_cells, cell_fill):
     letter = get_column_letter(col)
     for row in numbered_rows:
         r = row["row_num"]
@@ -1232,6 +1359,7 @@ def _write_day_value(ws, numbered_rows, child_rows, leaf_counts, computed, fname
                 cell = ws.cell(row=r, column=col, value=0)
                 formula_cells[f"{letter}{r}"] = 0
                 cell.font = BODY_FONT
+                cell.fill = cell_fill
                 cell.border = THIN_BORDER
                 cell.alignment = Alignment(horizontal="center")
                 continue
@@ -1239,12 +1367,13 @@ def _write_day_value(ws, numbered_rows, child_rows, leaf_counts, computed, fname
             cell = ws.cell(row=r, column=col, value=f"=SUM({refs})")
             formula_cells[f"{letter}{r}"] = cached_value
         cell.font = BODY_FONT
+        cell.fill = cell_fill
         cell.border = THIN_BORDER
         cell.alignment = Alignment(horizontal="center")
 
 
 def _write_week_or_month_total(ws, numbered_rows, computed, fname, stage_idx, first_col, last_col, total_col,
-                                formula_cells, explicit_cols=None, bucket_key=None):
+                                formula_cells, cell_fill, explicit_cols=None, bucket_key=None):
     letter = get_column_letter(total_col)
     kind, bucket = bucket_key
     for row in numbered_rows:
@@ -1257,8 +1386,30 @@ def _write_week_or_month_total(ws, numbered_rows, computed, fname, stage_idx, fi
         cached_value = computed.get(_row_key(row), {}).get((fname, stage_idx), {}).get(kind, {}).get(bucket, 0)
         formula_cells[f"{letter}{r}"] = cached_value
         cell.font = BOLD_BODY_FONT
+        cell.fill = cell_fill
         cell.border = THIN_BORDER
         cell.alignment = Alignment(horizontal="center")
+
+
+def _write_total_cell(ws, level1_rows, computed, fname, stage_idx, col, kind, bucket,
+                       formula_cells, cell_fill, total_row):
+    """Writes the always-visible grand-total row's cell for one column:
+    a flat SUM() over every Level-1 row's cell in that same column,
+    independent of the row-collapsing hierarchy."""
+    letter = get_column_letter(col)
+    if not level1_rows:
+        return
+    refs = ",".join(f"{letter}{row['row_num']}" for row in level1_rows)
+    cell = ws.cell(row=total_row, column=col, value=f"=SUM({refs})")
+    cached_value = sum(
+        computed.get(_row_key(row), {}).get((fname, stage_idx), {}).get(kind, {}).get(bucket, 0)
+        for row in level1_rows
+    )
+    cell.font = BOLD_BODY_FONT
+    cell.fill = cell_fill
+    cell.border = THIN_BORDER
+    cell.alignment = Alignment(horizontal="center")
+    formula_cells[f"{letter}{total_row}"] = cached_value
 
 
 # =========================================================================
@@ -1338,7 +1489,7 @@ def recompute_all_cells(rows, leaf_counts, ref, run_date) -> dict:
 # =========================================================================
 
 FUNNEL_STAGE_DESCRIPTIONS = {
-    ("New Contacts", "New Contacts"): "CONTACT.createdate this period AND DEAL.createdate this period",
+    ("New Contacts", "New Contacts"): "CONTACT.createdate this period (any deal state, incl. no deal at all)",
     ("New Contacts", "New Deals"): "same base population, no pipeline restriction",
     ("New Contacts", "Qualified Deals"): "same base population AND pipeline = Sales",
     ("New Contacts", "Opportunities"): "same base population AND pipeline = Sales AND SQL Lost Reason != Unreachable (blank passes)",
