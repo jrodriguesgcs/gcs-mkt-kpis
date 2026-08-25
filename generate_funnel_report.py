@@ -135,7 +135,7 @@ FUNNELS = [
 # hardcoded, per the spec's "search properties by label text" instruction).
 CONTACT_TYPE_EXCLUDE_LABELS = ["B2B Partnership Development", "B2B Institutional Relations"]
 LEAD_SOURCE_EXCLUDE_LABELS = ["Bundle Offer", "Other", "Instantly", "Private", "Walk-In",
-                              "Email", "Partner Referral", "Phone Call", "Events", "Client Referral"]
+                              "Email", "Partner Referral", "Phone Calls", "Events", "Client Referral"]
 BRAND_REQUIRED_LABEL = "Global Citizen Solutions"
 BRAND_DOMAIN_EXCLUDE_LABELS = ["BePortugal"]
 
@@ -640,7 +640,7 @@ def apply_overall_filters(contacts: list[dict], ref: ReferenceData) -> tuple[lis
     excl2 = set(ref.lead_source_exclude_values.values())
     run_filter(
         "Lead Source excludes Bundle Offer/Other/Instantly/Private/Walk-In/Email/Partner Referral/"
-        "Phone Call/Events/Client Referral (blanks pass)",
+        "Phone Calls/Events/Client Referral (blanks pass)",
         keep_fn=lambda c: c["lead_source"] is None or c["lead_source"] not in excl2,
         blank_fn=lambda c: c["lead_source"] is None,
     )
@@ -1264,7 +1264,7 @@ def _build_filters_sheet(wb, ref: ReferenceData, filter_steps, run_date, months)
     overall_filter_text = [
         "1. Contact Type is none of 'B2B Partnership Development', 'B2B Institutional Relations' (blanks pass).",
         "2. Lead Source is none of Bundle Offer/Other/Instantly/Private/Walk-In/Email/Partner Referral/"
-        "Phone Call/Events/Client Referral (blanks pass).",
+        "Phone Calls/Events/Client Referral (blanks pass).",
         f"3. Brand is exactly '{ref.brand_required_value}' (blanks FAIL this filter).",
         "4. Brand Domain is none of 'BePortugal' (blanks pass).",
     ]
