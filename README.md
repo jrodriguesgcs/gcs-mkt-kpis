@@ -183,24 +183,35 @@ recalculates automatically on open regardless.
 
 ## Performance
 
-The script fetches only contacts **created in the report year** (a
-server-side `createdate >= Jan 1` filter via the Search API), plus every
-deal associated with them. This was changed from an unfiltered full-portal
-fetch specifically to cut runtime on large portals — see the trade-off
-below before relying on it.
+The script fetches only contacts **created on/after a cutoff date**
+(default: Jan 1 of the report year; override with `FETCH_CONTACTS_SINCE`
+in `.env`, format `YYYY-MM-DD` — e.g. `2026-04-01` to only fetch contacts
+from April onward), **pre-filtered server-side by the 4 overall filters**
+via the Search API, plus every deal associated with the contacts that
+match. Both the cutoff and the server-side filtering exist purely to cut
+runtime/volume on large portals — the same 4 filters are still re-applied
+client-side in `apply_overall_filters()` as the authoritative pass (this
+is a volume-reduction optimization, not a substitute), so correctness
+doesn't depend on the server-side filters being exactly right, only on
+them not being *too* aggressive. Confirmed against this portal: HubSpot's
+`NOT_IN` operator already includes blank-property contacts (no separate
+"OR blank" clause needed), and `CONTAINS_TOKEN` correctly matches
+multi-valued properties like the resolved Brand property.
 
 **Accepted trade-off:** the New Deals and Existing Deals funnels are
 defined around contacts created *before* the period being evaluated. A
-contact created in a prior year that still produced deal activity this
-report year will **not** appear in either funnel under this filter — only
-New Contacts (which requires `contact.createdate` this period anyway) is
-unaffected. If your portal has a lot of deal activity on older contacts,
-this will visibly undercount those two funnels; the original unfiltered
-behavior (fetch every contact, regardless of year) is one line away if you
-need it back — see `fetch_contacts()`'s docstring.
+contact created before the cutoff that still produced deal activity this
+report year will **not** appear in either funnel — only New Contacts
+(which requires `contact.createdate` this period anyway) is unaffected.
+A later cutoff (e.g. April instead of January) makes this trade-off worse
+in exchange for a faster run; the original unfiltered behavior (fetch
+every contact regardless of date) is one line away if you need it back —
+see `fetch_contacts()`'s docstring.
 
-Also note: HubSpot's Search API caps total results at **10,000** per
-query regardless of pagination. If a single report year's new contacts
-exceed that on your portal, the excess will silently not be fetched —
-compare the printed "Fetched N contacts" line against your own HubSpot
-contact count filtered the same way if that's a realistic volume for you.
+Also note: HubSpot's Search API hard-caps pagination at **10,000**
+results — requesting the page *past* that boundary fails outright (a 400
+error), which the script now catches and reports as a **truncation
+warning** instead of crashing: `total contacts` in the warning tells you
+how many actually match vs. how many were fetched. If you see that
+warning, narrow `FETCH_CONTACTS_SINCE` to a later date to stay under the
+cap.

@@ -2,11 +2,13 @@
 """
 HubSpot Traffic-Source Funnel report generator.
 
-Fetches every contact created in the report year (see the "report-year
-contact filter" trade-off in fetch_contacts()'s docstring) + its
-associated deals from HubSpot, applies four portal-wide filters, and
-writes a styled Excel workbook to reports/funnel_report.xlsx with one
-sheet per funnel -- "New Contacts", "New Deals", "Existing Deals":
+Fetches every contact created on/after a cutoff date (see the trade-off
+in fetch_contacts()'s docstring; override with FETCH_CONTACTS_SINCE),
+pre-filtered server-side by the four overall filters, + its associated
+deals from HubSpot. The same four filters are re-applied client-side as
+the authoritative pass. Writes a styled Excel workbook to
+reports/funnel_report.xlsx with one sheet per funnel -- "New Contacts",
+"New Deals", "Existing Deals":
 
   Rows are Original Traffic Source, 3 levels deep (Source -> Drill-Down 1
   -> Drill-Down 2). Columns are that funnel's own applicable Stages (a
@@ -283,10 +285,17 @@ class HubSpotClient:
 
     def search_all(self, object_type: str, body: dict, label: str | None = None) -> list:
         """POST-paginate /crm/v3/objects/{type}/search using the `after`
-        cursor. Note: HubSpot's Search API caps total results at 10,000
-        regardless of pagination -- fine for a single report-year's worth
-        of new contacts, but don't reuse this for an unfiltered full-portal
-        fetch."""
+        cursor.
+
+        HubSpot's Search API hard-caps pagination at 10,000 results: once
+        `after` would reach offset 10000, the *next* page request itself
+        fails with a 400 ("There was a problem with the request") rather
+        than returning an empty page -- confirmed against a real 400 log
+        with `"after": "10000"` in the request body. So we stop and warn
+        as soon as we've collected 10,000, instead of making that request
+        and crashing. Narrow the search filters (a later report-year
+        cutoff, or the overall filters below) to stay under this if a
+        truncation warning shows up."""
         body = dict(body)
         body.setdefault("limit", 100)
         results = []
@@ -295,6 +304,13 @@ class HubSpotClient:
             results.extend(data.get("results", []))
             if label:
                 _print_progress(f"{label} fetched so far", len(results))
+            if len(results) >= 10000:
+                total = data.get("total")
+                if total is not None and total > len(results):
+                    print(f"\n  WARNING: HubSpot Search API's 10,000-result pagination cap was hit "
+                          f"({total:,} total match the filter) -- {total - len(results):,} are missing "
+                          f"from this fetch. Narrow the search filters to stay under the cap.")
+                break
             next_after = data.get("paging", {}).get("next", {}).get("after")
             if not next_after:
                 break
@@ -591,36 +607,68 @@ def resolve_reference_data(client: HubSpotClient) -> ReferenceData:
 
 
 def fetch_contacts(client: HubSpotClient, ref: ReferenceData, run_date: date) -> list[dict]:
-    """Fetches contacts created on/after Jan 1 of run_date's year only.
+    """Fetches contacts created on/after a cutoff date, pre-filtered
+    server-side by the 4 overall filters (still re-applied client-side in
+    apply_overall_filters() as the authoritative pass -- this is purely a
+    volume-reduction optimization, not a substitute).
+
+    Cutoff date: `FETCH_CONTACTS_SINCE` in `.env` (format YYYY-MM-DD)
+    overrides the default of Jan 1 of the report year -- e.g. set it to
+    2026-04-01 to only fetch contacts created on/after that date. A later
+    cutoff means a smaller, faster fetch, at the cost of the trade-off
+    below getting worse (fewer prior contacts are considered at all).
 
     ACCEPTED TRADE-OFF (explicitly requested, not a spec default): the
     New Deals and Existing Deals funnels are defined around contacts
-    created *before* the period being evaluated, so a contact created in
-    a prior year that still produced deal activity this report year will
-    not appear in either funnel -- only in New Contacts (which requires
-    contact.createdate this period anyway, so it's unaffected). This
-    filter trades that undercount for a much faster fetch on large
-    portals. Also note: HubSpot's Search API caps total results at
-    10,000 regardless of pagination -- if a single report year's new
-    contacts exceed that, some will silently be missing; watch the
-    printed fetched-count against your portal's own records if that's a
-    realistic volume for you.
+    created *before* the period being evaluated, so a contact created
+    before the cutoff that still produced deal activity this report year
+    will not appear in either funnel -- only in New Contacts (which
+    requires contact.createdate this period anyway, so it's unaffected).
+
+    Also note: HubSpot's Search API caps total results at 10,000
+    regardless of pagination (see search_all()'s docstring) -- narrow the
+    cutoff date if the printed fetched-count hits that cap.
     """
     props = [ref.source_prop, ref.dd1_prop, ref.dd2_prop, ref.contact_type_prop,
              ref.brand_prop, ref.brand_domain_prop, ref.lead_source_prop, "createdate"]
-    cutoff = datetime(run_date.year, 1, 1, tzinfo=timezone.utc)
+
+    since = os.environ.get("FETCH_CONTACTS_SINCE", "").strip()
+    if since:
+        try:
+            cutoff = datetime.strptime(since, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        except ValueError:
+            raise HubSpotError(f"FETCH_CONTACTS_SINCE={since!r} is not a valid YYYY-MM-DD date.")
+    else:
+        cutoff = datetime(run_date.year, 1, 1, tzinfo=timezone.utc)
     cutoff_ms = int(cutoff.timestamp() * 1000)
-    print(f"  Fetching contacts created on/after {cutoff.date().isoformat()} (report-year filter)...")
-    body = {
-        "filterGroups": [{"filters": [
-            # HubSpot's Search API requires filter values as strings, even
-            # for a numeric epoch-ms datetime filter -- sending a JSON
-            # integer here previously raised a 400 ("problem with the
-            # request").
-            {"propertyName": "createdate", "operator": "GTE", "value": str(cutoff_ms)}
-        ]}],
-        "properties": props,
-    }
+    print(f"  Fetching contacts created on/after {cutoff.date().isoformat()}"
+          f"{' (FETCH_CONTACTS_SINCE)' if since else ' (report-year default)'}, "
+          f"pre-filtered by the overall filters...")
+
+    filters = [
+        # HubSpot's Search API requires filter values as strings, even for
+        # a numeric epoch-ms datetime filter -- sending a JSON integer
+        # here previously raised a 400 ("problem with the request").
+        {"propertyName": "createdate", "operator": "GTE", "value": str(cutoff_ms)},
+        # Overall filters 1/2/4 (exclude a list, blanks pass): confirmed
+        # against this portal that HubSpot's NOT_IN operator already
+        # includes blank/no-value records (108,285 NOT_IN vs. 108,139
+        # blank-only on lead_source -- NOT_IN is a strict superset), so no
+        # separate "OR blank" clause is needed.
+        {"propertyName": ref.contact_type_prop, "operator": "NOT_IN",
+         "values": list(ref.contact_type_exclude_values.values())},
+        {"propertyName": ref.lead_source_prop, "operator": "NOT_IN",
+         "values": list(ref.lead_source_exclude_values.values())},
+        {"propertyName": ref.brand_domain_prop, "operator": "NOT_IN",
+         "values": list(ref.brand_domain_exclude_values.values())},
+        # Overall filter 3 (required value, blanks FAIL): CONTAINS_TOKEN
+        # rather than EQ, since the resolved Brand property can be
+        # multi-valued (e.g. "0;18395897") -- confirmed CONTAINS_TOKEN
+        # matches the same ~101,410-contact population EQ would only catch
+        # for single-valued records.
+        {"propertyName": ref.brand_prop, "operator": "CONTAINS_TOKEN", "value": ref.brand_required_value},
+    ]
+    body = {"filterGroups": [{"filters": filters}], "properties": props}
     raw = client.search_all("contacts", body, label="contacts")
     contacts = []
     for r in raw:
