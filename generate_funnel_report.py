@@ -632,21 +632,36 @@ def _resolve_fetch_cutoff(run_date: date) -> tuple[datetime, bool]:
     return datetime(run_date.year, 1, 1, tzinfo=timezone.utc), False
 
 
-def _overall_filter_steps(ref: ReferenceData, cutoff_ms: str) -> list[tuple[str, dict]]:
+def _overall_filter_steps(ref: ReferenceData, cutoff_ms: str) -> list[tuple[str, dict, bool]]:
     """The 4 overall filters as individual named search-filter clauses, in
     the same order fetch_contacts() ANDs them together -- shared with
     debug_contact_fetch_filters() so the incremental diagnostic tests the
-    exact same clauses the real fetch uses, not a re-typed approximation."""
+    exact same clauses the real fetch uses, not a re-typed approximation.
+
+    Each entry is (label, clause, server_side). Brand is server_side=False:
+    DEBUG_FETCH_FILTERS on a real run isolated it as the exact point a
+    Service Key's filtered count collapsed (21,616 -> 37, vs. ~13,617
+    expected) while the Contact Type/Lead Source/Brand Domain filters
+    matched expectations -- HubSpot's Business Units feature restricts
+    *filtering* on hs_all_assigned_business_unit_ids per-credential,
+    separately from ordinary CRM read scopes (confirmed the property's own
+    definition is correct: value "0" = "Global Citizen Solutions",
+    101,410 contacts portal-wide). So Brand is excluded from the
+    server-side search and left entirely to apply_overall_filters()'s
+    client-side check via _has_brand_value(), which reads the value from
+    each contact's normal properties payload instead of asking the search
+    index to filter on it. It stays in this list (server_side=False) so
+    the diagnostic can still show the drop when explicitly testing it."""
     return [
-        ("createdate cutoff", {"propertyName": "createdate", "operator": "GTE", "value": cutoff_ms}),
+        ("createdate cutoff", {"propertyName": "createdate", "operator": "GTE", "value": cutoff_ms}, True),
         ("+ Brand (required)", {"propertyName": ref.brand_prop, "operator": "CONTAINS_TOKEN",
-                                 "value": ref.brand_required_value}),
+                                 "value": ref.brand_required_value}, False),
         ("+ Contact Type (exclude)", {"propertyName": ref.contact_type_prop, "operator": "NOT_IN",
-                                       "values": list(ref.contact_type_exclude_values.values())}),
+                                       "values": list(ref.contact_type_exclude_values.values())}, True),
         ("+ Lead Source (exclude)", {"propertyName": ref.lead_source_prop, "operator": "NOT_IN",
-                                      "values": list(ref.lead_source_exclude_values.values())}),
+                                      "values": list(ref.lead_source_exclude_values.values())}, True),
         ("+ Brand Domain (exclude)", {"propertyName": ref.brand_domain_prop, "operator": "NOT_IN",
-                                       "values": list(ref.brand_domain_exclude_values.values())}),
+                                       "values": list(ref.brand_domain_exclude_values.values())}, True),
     ]
 
 
@@ -663,7 +678,7 @@ def debug_contact_fetch_filters(client: HubSpotClient, ref: ReferenceData, run_d
     print(f"=== DEBUG_FETCH_FILTERS: incremental filter totals (cutoff {cutoff.date().isoformat()}"
           f"{', from FETCH_CONTACTS_SINCE' if from_env else ''}) ===")
     accumulated: list[dict] = []
-    for label, clause in steps:
+    for label, clause, _server_side in steps:
         accumulated.append(clause)
         body = {"filterGroups": [{"filters": list(accumulated)}], "properties": ["createdate"], "limit": 1}
         data = client.post("/crm/v3/objects/contacts/search", is_search=True, json=body)
@@ -703,14 +718,21 @@ def fetch_contacts(client: HubSpotClient, ref: ReferenceData, run_date: date) ->
     # numeric epoch-ms datetime filter -- sending a JSON integer here
     # previously raised a 400 ("problem with the request").
     cutoff_ms = str(int(cutoff.timestamp() * 1000))
+    all_steps = _overall_filter_steps(ref, cutoff_ms)
+    skipped = [label for label, _clause, server_side in all_steps if not server_side]
     print(f"  Fetching contacts created on/after {cutoff.date().isoformat()}"
           f"{' (FETCH_CONTACTS_SINCE)' if from_env else ' (report-year default)'}, "
           f"pre-filtered by the overall filters...")
+    if skipped:
+        print(f"  NOTE: not filtering server-side on: {', '.join(skipped)} -- confirmed this Service Key's "
+              f"Search API results collapse when filtering on the Business Units (Brand) property "
+              f"specifically (a per-credential restriction, not a bug in the property mapping). "
+              f"apply_overall_filters() still applies it client-side as the authoritative check.")
 
     if os.environ.get("DEBUG_FETCH_FILTERS", "").strip().lower() in ("1", "true", "yes"):
         debug_contact_fetch_filters(client, ref, run_date)
 
-    filters = [clause for _label, clause in _overall_filter_steps(ref, cutoff_ms)]
+    filters = [clause for _label, clause, server_side in all_steps if server_side]
     body = {"filterGroups": [{"filters": filters}], "properties": props}
     raw = client.search_all("contacts", body, label="contacts")
     contacts = []

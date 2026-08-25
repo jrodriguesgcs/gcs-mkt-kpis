@@ -233,3 +233,20 @@ pinpointing exactly which filter (if any) causes an unexpected drop for
 your specific token, rather than guessing. (Every fetch already prints
 HubSpot's overall reported `total` on its first page too, regardless of
 this flag.)
+
+**Confirmed exception — Brand isn't filtered server-side.** Using
+`DEBUG_FETCH_FILTERS=1` against a real Service Key, the count collapsed
+specifically when adding the Brand filter (`hs_all_assigned_business_unit_ids
+CONTAINS_TOKEN`) — 21,616 → 37, instead of the ~13,617 a full-access
+credential returns for the same filter. The property's own definition was
+confirmed correct (value `"0"` = "Global Citizen Solutions", 101,410
+contacts portal-wide) — this is HubSpot's Business Units feature
+restricting a credential's ability to *filter* on that property via the
+Search API, separate from ordinary CRM scopes, not a bug in the property
+mapping. Brand is therefore excluded from the server-side search
+entirely and left to `apply_overall_filters()`'s client-side check
+(`_has_brand_value()`), which reads the value from each contact's normal
+properties instead of asking the search index to filter on it. This
+costs a somewhat larger contact fetch (Brand no longer narrows server-side)
+in exchange for correctness regardless of a token's Business Units
+filtering access.
