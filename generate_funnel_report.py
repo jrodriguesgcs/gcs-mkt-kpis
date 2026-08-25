@@ -160,6 +160,18 @@ def week_start(d: date) -> date:
     return d - timedelta(days=d.weekday())
 
 
+def _has_brand_value(raw_value: str | None, required_value: str) -> bool:
+    """True if required_value is present in raw_value, treating raw_value
+    as a ';'-separated token list. The resolved Brand property may be a
+    genuinely single-valued enum (a plain '==' would suffice) or HubSpot's
+    multi-valued Business Units property (a contact can belong to more
+    than one) -- token containment is correct for both without needing to
+    know which case applies."""
+    if not raw_value:
+        return False
+    return required_value in [token.strip() for token in raw_value.split(";")]
+
+
 def parse_hs_datetime(value) -> datetime | None:
     """Parse a HubSpot ISO-8601 datetime (or date-only) string to a UTC
     datetime. HubSpot v3 properties come back as strings like
@@ -395,23 +407,48 @@ def resolve_reference_data(client: HubSpotClient) -> ReferenceData:
           f"(excludes: {list(contact_type_exclude_values.values())})")
 
     # --- Brand (no property is guaranteed to be labeled literally "Brand")
+    #
+    # More than one property can plausibly be "Brand": an exact-label match,
+    # HubSpot's own multi-valued Business Units property
+    # (hs_all_assigned_business_unit_ids, label "Brands" -- present and
+    # populated on essentially every contact when Business Units is
+    # enabled), and any other enum property whose options happen to include
+    # "Global Citizen Solutions". A first pass at this (label-substring-only
+    # tie-break) picked a property called "Client x Brand" that turned out
+    # to be set on ~0.06% of contacts -- clearly a manual post-sale tag, not
+    # a general "which brand" field -- while hs_all_assigned_business_unit_ids
+    # covers ~92.6% of the portal, confirmed against live data and the
+    # user's explicit choice between the two. So: prefer an exact-label
+    # "Brand" match first, then hs_all_assigned_business_unit_ids
+    # specifically (by name, not just by label substring) if it carries the
+    # required option, and only fall back to the old generic scan -- which
+    # is one property-population check away from repeating the same
+    # mistake -- as a last resort.
     brand_prop = _by_label(contact_props, "Brand")
+    if brand_prop is None:
+        brand_prop = contact_props_by_name.get("hs_all_assigned_business_unit_ids")
+        if brand_prop and not any(
+            (o.get("label") or "").strip() == BRAND_REQUIRED_LABEL for o in brand_prop.get("options", [])
+        ):
+            brand_prop = None
     if brand_prop is None:
         candidates = [p for p in contact_props if p.get("type") == "enumeration"
                       and any((o.get("label") or "").strip() == BRAND_REQUIRED_LABEL for o in p.get("options", []))]
         if not candidates:
             raise HubSpotError(f"No contact property has an enum option '{BRAND_REQUIRED_LABEL}'.")
         brand_prop = next((p for p in candidates if "brand" in (p.get("label") or "").lower()), candidates[0])
+    if brand_prop.get("label", "").strip().lower() != "brand":
         msg = (f"NOTE: no contact property is labeled exactly 'Brand'; using '{brand_prop['name']}' "
-               f"(label '{brand_prop.get('label')}') -- the brand-ish property whose enum contains "
-               f"'{BRAND_REQUIRED_LABEL}'.")
+               f"(label '{brand_prop.get('label')}') -- see the comment above resolve_reference_data's "
+               f"Brand section for why this one and not another 'brand-ish' candidate.")
         print(f"  {msg}")
         flags.append(msg)
     brand_values = _match_option_values(brand_prop, [BRAND_REQUIRED_LABEL], flags)
     if BRAND_REQUIRED_LABEL not in brand_values:
         raise HubSpotError(f"Resolved Brand property '{brand_prop['name']}' has no option '{BRAND_REQUIRED_LABEL}'.")
     print(f"  Brand                                = {brand_prop['name']} (label: {brand_prop.get('label')}), "
-          f"required value = {brand_values[BRAND_REQUIRED_LABEL]!r}")
+          f"required value = {brand_values[BRAND_REQUIRED_LABEL]!r} "
+          f"(matched as a ';'-separated token, since this property may be multi-valued)")
 
     # --- Brand Domain
     brand_domain_prop = _by_label(contact_props, "Brand Domain") or _by_label(contact_props, "Brand domain")
@@ -646,8 +683,8 @@ def apply_overall_filters(contacts: list[dict], ref: ReferenceData) -> tuple[lis
     )
 
     run_filter(
-        f"Brand is exactly '{ref.brand_required_value}' (blanks FAIL this filter)",
-        keep_fn=lambda c: c["brand"] == ref.brand_required_value,
+        f"Brand includes '{ref.brand_required_value}' (blanks FAIL this filter)",
+        keep_fn=lambda c: _has_brand_value(c["brand"], ref.brand_required_value),
         blank_fn=lambda c: False,  # no blank-pass case for this filter by design
     )
 
@@ -1265,7 +1302,7 @@ def _build_filters_sheet(wb, ref: ReferenceData, filter_steps, run_date, months)
         "1. Contact Type is none of 'B2B Partnership Development', 'B2B Institutional Relations' (blanks pass).",
         "2. Lead Source is none of Bundle Offer/Other/Instantly/Private/Walk-In/Email/Partner Referral/"
         "Phone Calls/Events/Client Referral (blanks pass).",
-        f"3. Brand is exactly '{ref.brand_required_value}' (blanks FAIL this filter).",
+        f"3. Brand includes '{ref.brand_required_value}' (blanks FAIL this filter).",
         "4. Brand Domain is none of 'BePortugal' (blanks pass).",
     ]
     for line in overall_filter_text:

@@ -84,7 +84,7 @@ and prints a `NOTE` each time this happens. As of the last verified run:
 
 | Originally guessed | Actually used | Why |
 |---|---|---|
-| *(a property literally labeled "Brand")* | `client_x_brand` (label "Client x Brand") | no property is labeled exactly "Brand"; this is the brand-ish property whose enum contains "Global Citizen Solutions" |
+| *(a property literally labeled "Brand")* | `hs_all_assigned_business_unit_ids` (label "Brands", HubSpot's Business Units feature) | no property is labeled exactly "Brand". An earlier resolution picked `client_x_brand` ("Client x Brand") purely because its label also contained "brand" — but live data showed only ~0.06% of contacts have it set to "Global Citizen Solutions" (a manual post-sale tag), vs. ~92.6% tagged to the "Global Citizen Solutions" business unit via `hs_all_assigned_business_unit_ids`. Step 0 now prefers this property by name when it's present and carries the required option. Since a contact can belong to more than one business unit, the match is "value is present" (`;`-separated token containment), not exact equality. |
 | `sql_lost_reason` | `sql_lost` (label "SQL Lost Reason") | exact label match; the guessed internal name doesn't exist |
 | `proposal_sent_date` | `deal_proposal_sent_datetime` (label "Deal Proposal Sent Date Time") | closest label match; the guessed name doesn't exist |
 | `proposal_signed_date` | `deal_proposal_signed_datetime` (label "Deal Proposal Signed Date Time") | same reasoning |
