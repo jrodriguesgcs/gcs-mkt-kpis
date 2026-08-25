@@ -620,6 +620,58 @@ def resolve_reference_data(client: HubSpotClient) -> ReferenceData:
 # =========================================================================
 
 
+def _resolve_fetch_cutoff(run_date: date) -> tuple[datetime, bool]:
+    """Returns (cutoff, from_env). FETCH_CONTACTS_SINCE (.env, YYYY-MM-DD)
+    overrides the default of Jan 1 of the report year."""
+    since = os.environ.get("FETCH_CONTACTS_SINCE", "").strip()
+    if since:
+        try:
+            return datetime.strptime(since, "%Y-%m-%d").replace(tzinfo=timezone.utc), True
+        except ValueError:
+            raise HubSpotError(f"FETCH_CONTACTS_SINCE={since!r} is not a valid YYYY-MM-DD date.")
+    return datetime(run_date.year, 1, 1, tzinfo=timezone.utc), False
+
+
+def _overall_filter_steps(ref: ReferenceData, cutoff_ms: str) -> list[tuple[str, dict]]:
+    """The 4 overall filters as individual named search-filter clauses, in
+    the same order fetch_contacts() ANDs them together -- shared with
+    debug_contact_fetch_filters() so the incremental diagnostic tests the
+    exact same clauses the real fetch uses, not a re-typed approximation."""
+    return [
+        ("createdate cutoff", {"propertyName": "createdate", "operator": "GTE", "value": cutoff_ms}),
+        ("+ Brand (required)", {"propertyName": ref.brand_prop, "operator": "CONTAINS_TOKEN",
+                                 "value": ref.brand_required_value}),
+        ("+ Contact Type (exclude)", {"propertyName": ref.contact_type_prop, "operator": "NOT_IN",
+                                       "values": list(ref.contact_type_exclude_values.values())}),
+        ("+ Lead Source (exclude)", {"propertyName": ref.lead_source_prop, "operator": "NOT_IN",
+                                      "values": list(ref.lead_source_exclude_values.values())}),
+        ("+ Brand Domain (exclude)", {"propertyName": ref.brand_domain_prop, "operator": "NOT_IN",
+                                       "values": list(ref.brand_domain_exclude_values.values())}),
+    ]
+
+
+def debug_contact_fetch_filters(client: HubSpotClient, ref: ReferenceData, run_date: date) -> None:
+    """Diagnostic, opt-in via DEBUG_FETCH_FILTERS=1 in .env: adds the 4
+    overall filters to the contact search ONE AT A TIME, printing
+    HubSpot's own reported `total` after each addition. Pinpoints exactly
+    which filter (if any) causes an unexpected drop for this specific
+    credential/token, rather than guessing -- run this before the real
+    fetch if the final contact count looks implausibly low."""
+    cutoff, from_env = _resolve_fetch_cutoff(run_date)
+    cutoff_ms = str(int(cutoff.timestamp() * 1000))
+    steps = _overall_filter_steps(ref, cutoff_ms)
+    print(f"=== DEBUG_FETCH_FILTERS: incremental filter totals (cutoff {cutoff.date().isoformat()}"
+          f"{', from FETCH_CONTACTS_SINCE' if from_env else ''}) ===")
+    accumulated: list[dict] = []
+    for label, clause in steps:
+        accumulated.append(clause)
+        body = {"filterGroups": [{"filters": list(accumulated)}], "properties": ["createdate"], "limit": 1}
+        data = client.post("/crm/v3/objects/contacts/search", is_search=True, json=body)
+        total = data.get("total")
+        print(f"  {label:<28} total={total:,}" if isinstance(total, int) else f"  {label:<28} total={total!r}")
+    print("=== end DEBUG_FETCH_FILTERS ===\n")
+
+
 def fetch_contacts(client: HubSpotClient, ref: ReferenceData, run_date: date) -> list[dict]:
     """Fetches contacts created on/after a cutoff date, pre-filtered
     server-side by the 4 overall filters (still re-applied client-side in
@@ -646,42 +698,19 @@ def fetch_contacts(client: HubSpotClient, ref: ReferenceData, run_date: date) ->
     props = [ref.source_prop, ref.dd1_prop, ref.dd2_prop, ref.contact_type_prop,
              ref.brand_prop, ref.brand_domain_prop, ref.lead_source_prop, "createdate"]
 
-    since = os.environ.get("FETCH_CONTACTS_SINCE", "").strip()
-    if since:
-        try:
-            cutoff = datetime.strptime(since, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-        except ValueError:
-            raise HubSpotError(f"FETCH_CONTACTS_SINCE={since!r} is not a valid YYYY-MM-DD date.")
-    else:
-        cutoff = datetime(run_date.year, 1, 1, tzinfo=timezone.utc)
-    cutoff_ms = int(cutoff.timestamp() * 1000)
+    cutoff, from_env = _resolve_fetch_cutoff(run_date)
+    # HubSpot's Search API requires filter values as strings, even for a
+    # numeric epoch-ms datetime filter -- sending a JSON integer here
+    # previously raised a 400 ("problem with the request").
+    cutoff_ms = str(int(cutoff.timestamp() * 1000))
     print(f"  Fetching contacts created on/after {cutoff.date().isoformat()}"
-          f"{' (FETCH_CONTACTS_SINCE)' if since else ' (report-year default)'}, "
+          f"{' (FETCH_CONTACTS_SINCE)' if from_env else ' (report-year default)'}, "
           f"pre-filtered by the overall filters...")
 
-    filters = [
-        # HubSpot's Search API requires filter values as strings, even for
-        # a numeric epoch-ms datetime filter -- sending a JSON integer
-        # here previously raised a 400 ("problem with the request").
-        {"propertyName": "createdate", "operator": "GTE", "value": str(cutoff_ms)},
-        # Overall filters 1/2/4 (exclude a list, blanks pass): confirmed
-        # against this portal that HubSpot's NOT_IN operator already
-        # includes blank/no-value records (108,285 NOT_IN vs. 108,139
-        # blank-only on lead_source -- NOT_IN is a strict superset), so no
-        # separate "OR blank" clause is needed.
-        {"propertyName": ref.contact_type_prop, "operator": "NOT_IN",
-         "values": list(ref.contact_type_exclude_values.values())},
-        {"propertyName": ref.lead_source_prop, "operator": "NOT_IN",
-         "values": list(ref.lead_source_exclude_values.values())},
-        {"propertyName": ref.brand_domain_prop, "operator": "NOT_IN",
-         "values": list(ref.brand_domain_exclude_values.values())},
-        # Overall filter 3 (required value, blanks FAIL): CONTAINS_TOKEN
-        # rather than EQ, since the resolved Brand property can be
-        # multi-valued (e.g. "0;18395897") -- confirmed CONTAINS_TOKEN
-        # matches the same ~101,410-contact population EQ would only catch
-        # for single-valued records.
-        {"propertyName": ref.brand_prop, "operator": "CONTAINS_TOKEN", "value": ref.brand_required_value},
-    ]
+    if os.environ.get("DEBUG_FETCH_FILTERS", "").strip().lower() in ("1", "true", "yes"):
+        debug_contact_fetch_filters(client, ref, run_date)
+
+    filters = [clause for _label, clause in _overall_filter_steps(ref, cutoff_ms)]
     body = {"filterGroups": [{"filters": filters}], "properties": props}
     raw = client.search_all("contacts", body, label="contacts")
     contacts = []

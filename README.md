@@ -224,3 +224,12 @@ warning** instead of crashing: `total contacts` in the warning tells you
 how many actually match vs. how many were fetched. If you see that
 warning, narrow `FETCH_CONTACTS_SINCE` to a later date to stay under the
 cap.
+
+**If the fetched contact count looks implausibly low** for your portal,
+set `DEBUG_FETCH_FILTERS=1` in `.env` and re-run: before the real fetch,
+the script adds the 4 overall filters to the contact search **one at a
+time**, printing HubSpot's own reported `total` after each addition —
+pinpointing exactly which filter (if any) causes an unexpected drop for
+your specific token, rather than guessing. (Every fetch already prints
+HubSpot's overall reported `total` on its first page too, regardless of
+this flag.)
