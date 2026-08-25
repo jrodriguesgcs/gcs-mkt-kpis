@@ -2,9 +2,10 @@
 """
 HubSpot Traffic-Source Funnel report generator.
 
-Fetches every contact + its associated deals from HubSpot, applies four
-portal-wide filters, and writes a single styled Excel workbook to
-reports/funnel_report.xlsx:
+Fetches every contact created in the report year (see the "report-year
+contact filter" trade-off in fetch_contacts()'s docstring) + its
+associated deals from HubSpot, applies four portal-wide filters, and
+writes a single styled Excel workbook to reports/funnel_report.xlsx:
 
   - "Funnel Report": rows are Original Traffic Source, 3 levels deep
     (Source -> Drill-Down 1 -> Drill-Down 2), columns are
@@ -248,6 +249,24 @@ class HubSpotClient:
             if not next_after:
                 break
             params["after"] = next_after
+        return results
+
+    def search_all(self, object_type: str, body: dict) -> list:
+        """POST-paginate /crm/v3/objects/{type}/search using the `after`
+        cursor. Note: HubSpot's Search API caps total results at 10,000
+        regardless of pagination -- fine for a single report-year's worth
+        of new contacts, but don't reuse this for an unfiltered full-portal
+        fetch."""
+        body = dict(body)
+        body.setdefault("limit", 100)
+        results = []
+        while True:
+            data = self.post(f"/crm/v3/objects/{object_type}/search", is_search=True, json=body)
+            results.extend(data.get("results", []))
+            next_after = data.get("paging", {}).get("next", {}).get("after")
+            if not next_after:
+                break
+            body["after"] = next_after
         return results
 
     def batch_read(self, object_type: str, ids: list[str], properties: list[str]) -> list:
@@ -502,10 +521,34 @@ def resolve_reference_data(client: HubSpotClient) -> ReferenceData:
 # =========================================================================
 
 
-def fetch_contacts(client: HubSpotClient, ref: ReferenceData) -> list[dict]:
+def fetch_contacts(client: HubSpotClient, ref: ReferenceData, run_date: date) -> list[dict]:
+    """Fetches contacts created on/after Jan 1 of run_date's year only.
+
+    ACCEPTED TRADE-OFF (explicitly requested, not a spec default): the
+    New Deals and Existing Deals funnels are defined around contacts
+    created *before* the period being evaluated, so a contact created in
+    a prior year that still produced deal activity this report year will
+    not appear in either funnel -- only in New Contacts (which requires
+    contact.createdate this period anyway, so it's unaffected). This
+    filter trades that undercount for a much faster fetch on large
+    portals. Also note: HubSpot's Search API caps total results at
+    10,000 regardless of pagination -- if a single report year's new
+    contacts exceed that, some will silently be missing; watch the
+    printed fetched-count against your portal's own records if that's a
+    realistic volume for you.
+    """
     props = [ref.source_prop, ref.dd1_prop, ref.dd2_prop, ref.contact_type_prop,
              ref.brand_prop, ref.brand_domain_prop, ref.lead_source_prop, "createdate"]
-    raw = client.paginate("/crm/v3/objects/contacts", params={"limit": 100, "properties": ",".join(props)})
+    cutoff = datetime(run_date.year, 1, 1, tzinfo=timezone.utc)
+    cutoff_ms = int(cutoff.timestamp() * 1000)
+    print(f"  Fetching contacts created on/after {cutoff.date().isoformat()} (report-year filter)...")
+    body = {
+        "filterGroups": [{"filters": [
+            {"propertyName": "createdate", "operator": "GTE", "value": cutoff_ms}
+        ]}],
+        "properties": props,
+    }
+    raw = client.search_all("contacts", body)
     contacts = []
     for r in raw:
         p = r.get("properties", {})
@@ -1530,8 +1573,10 @@ def main() -> int:
         client = HubSpotClient(access_token)
         ref = resolve_reference_data(client)
 
+        run_date = datetime.now(timezone.utc).date()
+
         print("Fetching contacts...")
-        all_contacts = fetch_contacts(client, ref)
+        all_contacts = fetch_contacts(client, ref, run_date)
         print(f"  Fetched {len(all_contacts)} contacts")
         print("Fetching associated deals...")
         attach_deals(client, ref, all_contacts)
@@ -1546,7 +1591,6 @@ def main() -> int:
               f"{sum(1 for r in rows if r['level'] == 2)} Level-2, "
               f"{sum(1 for r in rows if r['level'] == 3)} Level-3)\n")
 
-        run_date = datetime.now(timezone.utc).date()
         leaf_counts = compute_leaf_counts(rows, ref)
 
         os.makedirs(os.path.dirname(OUTPUT_PATH), exist_ok=True)

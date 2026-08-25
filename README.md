@@ -177,9 +177,24 @@ recalculates automatically on open regardless.
 
 ## Performance
 
-The script fetches **all** contacts (no server-side date filter, since
-the "Existing Deals"/"New Deals" funnels need contacts created before any
-given period, not just this year) and every deal associated with them.
-On a portal with tens of thousands of contacts this can take a while —
-expect most of the runtime to be HubSpot API pagination, not the Excel
-build itself.
+The script fetches only contacts **created in the report year** (a
+server-side `createdate >= Jan 1` filter via the Search API), plus every
+deal associated with them. This was changed from an unfiltered full-portal
+fetch specifically to cut runtime on large portals — see the trade-off
+below before relying on it.
+
+**Accepted trade-off:** the New Deals and Existing Deals funnels are
+defined around contacts created *before* the period being evaluated. A
+contact created in a prior year that still produced deal activity this
+report year will **not** appear in either funnel under this filter — only
+New Contacts (which requires `contact.createdate` this period anyway) is
+unaffected. If your portal has a lot of deal activity on older contacts,
+this will visibly undercount those two funnels; the original unfiltered
+behavior (fetch every contact, regardless of year) is one line away if you
+need it back — see `fetch_contacts()`'s docstring.
+
+Also note: HubSpot's Search API caps total results at **10,000** per
+query regardless of pagination. If a single report year's new contacts
+exceed that on your portal, the excess will silently not be fetched —
+compare the printed "Fetched N contacts" line against your own HubSpot
+contact count filtered the same way if that's a realistic volume for you.
