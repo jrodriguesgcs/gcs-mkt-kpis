@@ -19,6 +19,25 @@ its children, so collapsing anything never changes a visible total. Every
 row and column starts fully collapsed to its coarsest level (Source;
 Month) when the file is opened.
 
+Row 3 on every sheet is an always-visible **Total** row — a grand total
+across every Source, for every Stage/Month/Week/Day column — frozen in
+place along with the header rows, so it's never scrolled out of view.
+It isn't part of the collapsible row hierarchy.
+
+Each Stage's header (row 1) is filled with that stage's own color from
+the shared ramp, and its data cells (including the Total row) carry a
+light tint of that same hue, so a stage's whole column group reads as
+one coherent color block — handy once other stages are collapsed.
+
+**"New Contacts" (the stage, under the New Contacts funnel)** counts
+every contact matching the 4 overall filters and created in that
+Month/Week/Day, regardless of whether it has an associated deal yet, or
+when that deal was created — it's purely about the contact's own
+`createdate`. (An earlier version incorrectly required a deal created
+in the same month; fixed after cross-checking a generated report
+against live HubSpot data turned up two concrete under-counted
+contacts.)
+
 There's no separate "Filters & Definitions" sheet — Step 0's resolved
 properties, the filter audit trail, and the funnel/stage definitions are
 still printed to the console on every run (see below), they just aren't
