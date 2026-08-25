@@ -1489,7 +1489,7 @@ def recompute_all_cells(rows, leaf_counts, ref, run_date) -> dict:
 # =========================================================================
 
 FUNNEL_STAGE_DESCRIPTIONS = {
-    ("New Contacts", "New Contacts"): "CONTACT.createdate this period AND DEAL.createdate this period",
+    ("New Contacts", "New Contacts"): "CONTACT.createdate this period (any deal state, incl. no deal at all)",
     ("New Contacts", "New Deals"): "same base population, no pipeline restriction",
     ("New Contacts", "Qualified Deals"): "same base population AND pipeline = Sales",
     ("New Contacts", "Opportunities"): "same base population AND pipeline = Sales AND SQL Lost Reason != Unreachable (blank passes)",
