@@ -185,6 +185,25 @@ def parse_hs_datetime(value) -> datetime | None:
 
 
 # =========================================================================
+# Progress printing -- long-running steps (contact/deal fetch, workbook
+# build) overwrite a single line so the run never looks stalled without
+# spamming the console with one line per page/chunk.
+# =========================================================================
+
+
+def _print_progress(label: str, count: int, total: int | None = None) -> None:
+    suffix = f"/{total:,}" if total is not None else ""
+    # \x1b[K clears the rest of the line after the cursor -- without it, a
+    # shorter new line (e.g. label text shrinking) would leave stray
+    # characters from the previous, longer line visible past it.
+    print(f"\r  ...{count:,}{suffix} {label}\x1b[K", end="", flush=True)
+
+
+def _print_progress_done() -> None:
+    print()  # move off the overwritten progress line
+
+
+# =========================================================================
 # HubSpot client (Bearer auth, retry/backoff, pagination helpers)
 # =========================================================================
 
@@ -245,19 +264,24 @@ class HubSpotClient:
     def post(self, path: str, is_search: bool = False, **kwargs):
         return self.request("POST", path, is_search=is_search, **kwargs)
 
-    def paginate(self, path: str, params: dict | None = None, results_key: str = "results") -> list:
+    def paginate(self, path: str, params: dict | None = None, results_key: str = "results",
+                 label: str | None = None) -> list:
         params = dict(params or {})
         results = []
         while True:
             data = self.get(path, params=params)
             results.extend(data.get(results_key, []))
+            if label:
+                _print_progress(f"{label} fetched so far", len(results))
             next_after = data.get("paging", {}).get("next", {}).get("after")
             if not next_after:
                 break
             params["after"] = next_after
+        if label:
+            _print_progress_done()
         return results
 
-    def search_all(self, object_type: str, body: dict) -> list:
+    def search_all(self, object_type: str, body: dict, label: str | None = None) -> list:
         """POST-paginate /crm/v3/objects/{type}/search using the `after`
         cursor. Note: HubSpot's Search API caps total results at 10,000
         regardless of pagination -- fine for a single report-year's worth
@@ -269,13 +293,18 @@ class HubSpotClient:
         while True:
             data = self.post(f"/crm/v3/objects/{object_type}/search", is_search=True, json=body)
             results.extend(data.get("results", []))
+            if label:
+                _print_progress(f"{label} fetched so far", len(results))
             next_after = data.get("paging", {}).get("next", {}).get("after")
             if not next_after:
                 break
             body["after"] = next_after
+        if label:
+            _print_progress_done()
         return results
 
-    def batch_read(self, object_type: str, ids: list[str], properties: list[str]) -> list:
+    def batch_read(self, object_type: str, ids: list[str], properties: list[str],
+                    label: str | None = None) -> list:
         results = []
         ids = list(dict.fromkeys(ids))
         for i in range(0, len(ids), 100):
@@ -283,9 +312,14 @@ class HubSpotClient:
             body = {"properties": properties, "inputs": [{"id": obj_id} for obj_id in chunk]}
             data = self.post(f"/crm/v3/objects/{object_type}/batch/read", json=body)
             results.extend(data.get("results", []))
+            if label:
+                _print_progress(f"{label} processed", min(i + 100, len(ids)), total=len(ids))
+        if label:
+            _print_progress_done()
         return results
 
-    def batch_read_associations(self, from_type: str, to_type: str, ids: list[str]) -> dict:
+    def batch_read_associations(self, from_type: str, to_type: str, ids: list[str],
+                                 label: str | None = None) -> dict:
         result_map: dict = {}
         ids = list(dict.fromkeys(ids))
         for i in range(0, len(ids), 100):
@@ -296,6 +330,10 @@ class HubSpotClient:
                 from_id = str(entry.get("from", {}).get("id"))
                 to_ids = [str(to.get("toObjectId")) for to in entry.get("to", [])]
                 result_map[from_id] = to_ids
+            if label:
+                _print_progress(f"{label} processed", min(i + 100, len(ids)), total=len(ids))
+        if label:
+            _print_progress_done()
         return result_map
 
 
@@ -575,11 +613,15 @@ def fetch_contacts(client: HubSpotClient, ref: ReferenceData, run_date: date) ->
     print(f"  Fetching contacts created on/after {cutoff.date().isoformat()} (report-year filter)...")
     body = {
         "filterGroups": [{"filters": [
-            {"propertyName": "createdate", "operator": "GTE", "value": cutoff_ms}
+            # HubSpot's Search API requires filter values as strings, even
+            # for a numeric epoch-ms datetime filter -- sending a JSON
+            # integer here previously raised a 400 ("problem with the
+            # request").
+            {"propertyName": "createdate", "operator": "GTE", "value": str(cutoff_ms)}
         ]}],
         "properties": props,
     }
-    raw = client.search_all("contacts", body)
+    raw = client.search_all("contacts", body, label="contacts")
     contacts = []
     for r in raw:
         p = r.get("properties", {})
@@ -603,11 +645,13 @@ def fetch_contacts(client: HubSpotClient, ref: ReferenceData, run_date: date) ->
 
 def attach_deals(client: HubSpotClient, ref: ReferenceData, contacts: list[dict]) -> None:
     contact_ids = [c["id"] for c in contacts]
-    assoc_map = client.batch_read_associations("contacts", "deals", contact_ids)
+    print("  Fetching contact-to-deal associations...")
+    assoc_map = client.batch_read_associations("contacts", "deals", contact_ids, label="contact-deal associations")
     all_deal_ids = sorted({d for ids in assoc_map.values() for d in ids})
     deal_props = ["pipeline", "createdate", ref.sql_lost_prop, ref.owner_assigneddate_prop,
                   ref.proposal_sent_prop, ref.proposal_signed_prop]
-    deals_raw = client.batch_read("deals", all_deal_ids, deal_props)
+    print(f"  Fetching properties for {len(all_deal_ids):,} distinct deals...")
+    deals_raw = client.batch_read("deals", all_deal_ids, deal_props, label="deals")
     deals_by_id = {}
     for d in deals_raw:
         p = d.get("properties", {})
@@ -813,11 +857,11 @@ def compute_leaf_counts(rows: list[dict], ref: ReferenceData) -> dict:
     {date: count} dict of literal (not formula) values. This is the single
     ground truth every rollup -- row-wise and time-wise -- is built from."""
     leaf_counts: dict = {}
-    for row in rows:
-        if row["level"] != 3:
-            continue
+    leaf_rows = [row for row in rows if row["level"] == 3]
+    for processed, row in enumerate(leaf_rows, start=1):
         key = (row["source"], row["dd1"], row["dd2"])
         leaf_counts[key] = {}
+        _print_progress("leaf rows computed", processed, total=len(leaf_rows))
         for funnel in FUNNELS:
             fname = funnel["name"]
             for stage_idx, applicable in enumerate(funnel["applicable"]):
@@ -836,6 +880,8 @@ def compute_leaf_counts(rows: list[dict], ref: ReferenceData) -> dict:
                             if d is not None:
                                 counts[d] = counts.get(d, 0) + 1
                 leaf_counts[key][(fname, stage_idx)] = counts
+    if leaf_rows:
+        _print_progress_done()
     return leaf_counts
 
 
@@ -927,11 +973,13 @@ def build_workbook(rows: list[dict], leaf_counts: dict, ref: ReferenceData,
     (workbook, {sheet_name: {cell_ref: cached_value}}, {sheet_name: column_count})."""
     months, group_width = build_time_layout(run_date)
     wb = Workbook()
+    print("  Pre-computing row/time rollups (for cell formulas' cached values)...")
     computed = recompute_all_cells(rows, leaf_counts, ref, run_date)
 
     sheet_cell_values: dict = {}
     sheet_col_counts: dict = {}
     for i, funnel in enumerate(FUNNELS):
+        print(f"  Building sheet '{funnel['name']}' ({i + 1}/{len(FUNNELS)})...")
         ws = wb.active if i == 0 else wb.create_sheet(funnel["name"])
         ws.title = funnel["name"]
         formula_cells: dict = {}
@@ -1023,11 +1071,11 @@ def _build_single_funnel_sheet(ws, funnel, rows, leaf_counts, computed, run_date
 
     # --- column layout + data cells, one applicable stage-group at a time
     ramp = hsl_ramp(funnel["base_color"], n=6)
+    applicable_stages = [(i, s) for i, s in enumerate(STAGE_LABELS) if funnel["applicable"][i]]
     col = LABEL_COL + 1
     total_data_cols = 0
-    for stage_idx, stage_label in enumerate(STAGE_LABELS):
-        if not funnel["applicable"][stage_idx]:
-            continue
+    for done, (stage_idx, stage_label) in enumerate(applicable_stages, start=1):
+        _print_progress(f"stage columns written ({stage_label})", done, total=len(applicable_stages))
         stage_start_col = col
         fill_hex = ramp[stage_idx]
         stage_fill = PatternFill(fill_type="solid", fgColor=fill_hex)
@@ -1075,6 +1123,9 @@ def _build_single_funnel_sheet(ws, funnel, rows, leaf_counts, computed, run_date
 
         col = stage_end_col + 1
         total_data_cols += group_width
+
+    if applicable_stages:
+        _print_progress_done()
 
     last_col = col - 1
     for c in range(LABEL_COL + 1, last_col + 1):

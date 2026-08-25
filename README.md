@@ -68,6 +68,11 @@ leftover state.
 
 ### What gets printed
 
+Every long-running step (fetching contacts, fetching deals, computing
+per-row funnel metrics, building each sheet) prints a live, overwriting
+progress line (e.g. `...12,400 contacts fetched so far`) so the run never
+looks stalled, in addition to:
+
 1. **Step 0** — every resolved contact/deal property, pipeline id, and
    stage id, plus a `NOTE`/`WARNING` line for anything that diverged from
    this project's original guess (see **Terminology notes** below).
