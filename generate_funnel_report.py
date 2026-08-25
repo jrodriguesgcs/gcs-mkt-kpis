@@ -5,18 +5,18 @@ HubSpot Traffic-Source Funnel report generator.
 Fetches every contact created in the report year (see the "report-year
 contact filter" trade-off in fetch_contacts()'s docstring) + its
 associated deals from HubSpot, applies four portal-wide filters, and
-writes a single styled Excel workbook to reports/funnel_report.xlsx:
+writes a styled Excel workbook to reports/funnel_report.xlsx with one
+sheet per funnel -- "New Contacts", "New Deals", "Existing Deals":
 
-  - "Funnel Report": rows are Original Traffic Source, 3 levels deep
-    (Source -> Drill-Down 1 -> Drill-Down 2), columns are
-    Funnel (New Contacts / New Deals / Existing Deals) x Stage (6 stages
-    each) x Time (Month -> Week -> Day, full calendar year). Both axes use
-    Excel's native Group & Outline (+/- buttons) so a viewer can expand or
-    collapse either hierarchy without touching a pivot table.
-  - "Filters & Definitions": a static reference sheet documenting every
-    resolved property/pipeline/stage id, the four overall filters as
-    applied, the funnel/stage definition table, the filter audit trail,
-    and which months/weeks this run treated as in-progress vs. finished.
+  Rows are Original Traffic Source, 3 levels deep (Source -> Drill-Down 1
+  -> Drill-Down 2). Columns are that funnel's own applicable Stages (a
+  stage that doesn't apply to a given funnel is simply omitted from that
+  funnel's sheet, not placeholder-filled) x Time (Month -> Week -> Day,
+  full calendar year). Both axes use Excel's native Group & Outline (+/-
+  buttons) so a viewer can expand or collapse either hierarchy one level
+  at a time without touching a pivot table -- every row and column starts
+  fully collapsed to its coarsest level (Source; Month) when the file is
+  opened.
 
 Run with:  python generate_funnel_report.py
 
@@ -57,7 +57,6 @@ NIGHT_BLUE = "000957"
 ELECTRIC_BLUE = "3F8CFF"
 SLATE = "414856"
 BORDER_TINT = "E3EDFF"
-MUTED_GRAY = "E9ECF1"  # neutral fill for N/A stage columns (not a ramp colour)
 
 FONT_BODY = "Heebo"
 FONT_TITLE = "Yrsa"
@@ -65,15 +64,10 @@ FONT_MONO = "JetBrains Mono"
 
 THIN_BORDER = Border(*(Side(style="thin", color=BORDER_TINT) for _ in range(4)))
 HEADER_FILL = PatternFill(fill_type="solid", fgColor=NIGHT_BLUE)
-HEADER_FONT = Font(name=FONT_BODY, color="FFFFFF", bold=True)
 BODY_FONT = Font(name=FONT_BODY, color=SLATE)
 BOLD_BODY_FONT = Font(name=FONT_BODY, color=SLATE, bold=True)
 MONO_FONT = Font(name=FONT_MONO, color=SLATE)
-TITLE_FONT = Font(name=FONT_TITLE, color=NIGHT_BLUE, size=14)
-SECTION_TITLE_FONT = Font(name=FONT_TITLE, color=NIGHT_BLUE, size=12)
-MUTED_ITALIC_FONT = Font(name=FONT_BODY, color=SLATE, italic=True, size=9)
-NA_FILL = PatternFill(fill_type="solid", fgColor=MUTED_GRAY)
-NA_FONT = Font(name=FONT_BODY, color=SLATE, italic=True)
+CORNER_TITLE_FONT = Font(name=FONT_TITLE, color="FFFFFF", size=12)  # Yrsa, weight 400 -- titles only
 
 SEARCH_API_DELAY_SECONDS = 0.25
 MAX_RETRIES = 5
@@ -926,17 +920,27 @@ LABEL_COL = 1  # column A holds the row label
 # =========================================================================
 
 
-def build_workbook(rows: list[dict], leaf_counts: dict, ref: ReferenceData, run_date: date,
-                    filter_steps: list[FilterStep]) -> tuple[Workbook, dict, int]:
+def build_workbook(rows: list[dict], leaf_counts: dict, ref: ReferenceData,
+                    run_date: date) -> tuple[Workbook, dict, dict]:
+    """One sheet per funnel (no combined sheet, no Filters & Definitions
+    sheet -- see the "3 per-funnel tabs" follow-up). Returns
+    (workbook, {sheet_name: {cell_ref: cached_value}}, {sheet_name: column_count})."""
     months, group_width = build_time_layout(run_date)
     wb = Workbook()
-    formula_cells: dict = {}
     computed = recompute_all_cells(rows, leaf_counts, ref, run_date)
 
-    total_cols = _build_funnel_sheet(wb, rows, leaf_counts, computed, ref, run_date, months, group_width, formula_cells)
-    _build_filters_sheet(wb, ref, filter_steps, run_date, months)
+    sheet_cell_values: dict = {}
+    sheet_col_counts: dict = {}
+    for i, funnel in enumerate(FUNNELS):
+        ws = wb.active if i == 0 else wb.create_sheet(funnel["name"])
+        ws.title = funnel["name"]
+        formula_cells: dict = {}
+        col_count = _build_single_funnel_sheet(ws, funnel, rows, leaf_counts, computed, run_date,
+                                                months, group_width, formula_cells)
+        sheet_cell_values[funnel["name"]] = formula_cells
+        sheet_col_counts[funnel["name"]] = col_count
 
-    return wb, {"Funnel Report": formula_cells}, total_cols
+    return wb, sheet_cell_values, sheet_col_counts
 
 
 def _assign_row_numbers(rows: list[dict], header_rows: int) -> tuple[list[dict], dict]:
@@ -966,24 +970,40 @@ def _assign_row_numbers(rows: list[dict], header_rows: int) -> tuple[list[dict],
     return numbered, child_rows
 
 
-def _build_funnel_sheet(wb, rows, leaf_counts, computed, ref, run_date, months, group_width, formula_cells) -> int:
-    ws = wb.active
-    ws.title = "Funnel Report"
-    ws.sheet_properties.outlinePr = Outline(summaryBelow=True, summaryRight=True)
+def _build_single_funnel_sheet(ws, funnel, rows, leaf_counts, computed, run_date,
+                                months, group_width, formula_cells) -> int:
+    """Builds one funnel's own sheet: Stage -> Month -> Week -> Day columns
+    (no funnel band -- the tab itself is the funnel), only that funnel's
+    applicable stages (N/A ones are omitted entirely, not placeholder-filled,
+    per the "3 per-funnel tabs" follow-up)."""
+    fname = funnel["name"]
+    # summaryBelow=False: Level-1 rows are written ABOVE their Level-2/3
+    # children in this sheet (not below, as Excel's default subtotal-style
+    # grouping assumes) -- summaryBelow=True here would give Excel the
+    # wrong anchor row for each group's +/- control and is what "click +
+    # expands downward" actually requires for a summary-row-on-top layout.
+    # summaryRight=True is correct as-is: Week/Month totals sit to the
+    # right of the columns they sum.
+    ws.sheet_properties.outlinePr = Outline(summaryBelow=False, summaryRight=True)
 
-    HEADER_ROWS = 3  # 1: funnel band, 2: stage band, 3: time label
+    HEADER_ROWS = 2  # 1: stage band, 2: time label
     numbered_rows, child_rows = _assign_row_numbers(rows, HEADER_ROWS)
 
     # --- corner title
     ws.merge_cells(start_row=1, start_column=LABEL_COL, end_row=HEADER_ROWS, end_column=LABEL_COL)
     corner = ws.cell(row=1, column=LABEL_COL, value=f"Original Traffic Source ({run_date.year})")
     corner.fill = HEADER_FILL
-    corner.font = HEADER_FONT
+    corner.font = CORNER_TITLE_FONT
     corner.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
     corner.border = THIN_BORDER
     ws.column_dimensions[get_column_letter(LABEL_COL)].width = 30
 
     # --- row labels + row outline levels + row-side rollup formulas (Day cells only)
+    #
+    # Only Level 1 is visible on open -- Level 2 AND Level 3 both start
+    # hidden. (A prior version wrongly left Level 2 visible by default,
+    # which made opening the sheet look like two levels were already
+    # expanded, and a single click on Level 1 jumped straight to Level 3.)
     for row in numbered_rows:
         r = row["row_num"]
         if row["level"] == 1:
@@ -997,91 +1017,64 @@ def _build_funnel_sheet(wb, rows, leaf_counts, computed, ref, run_date, months, 
         cell.border = THIN_BORDER
         cell.alignment = Alignment(indent=row["level"] - 1)
         ws.row_dimensions[r].outline_level = row["level"] - 1
-        if row["level"] < 3:
-            ws.row_dimensions[r].hidden = False
-        else:
-            ws.row_dimensions[r].hidden = True
-        if row["level"] == 1:
-            ws.row_dimensions[r].collapsed = True  # its Level-2 children start collapsed
-        elif row["level"] == 2:
-            ws.row_dimensions[r].collapsed = True  # its Level-3 children start collapsed
+        ws.row_dimensions[r].hidden = row["level"] != 1
+        if row["level"] in (1, 2):
+            ws.row_dimensions[r].collapsed = True  # its children start collapsed
 
-    # --- column layout + data cells, one stage-group at a time
+    # --- column layout + data cells, one applicable stage-group at a time
+    ramp = hsl_ramp(funnel["base_color"], n=6)
     col = LABEL_COL + 1
     total_data_cols = 0
-    for funnel in FUNNELS:
-        fname = funnel["name"]
-        ramp = hsl_ramp(funnel["base_color"], n=6)
-        for stage_idx, stage_label in enumerate(STAGE_LABELS):
-            applicable = funnel["applicable"][stage_idx]
-            stage_start_col = col
-            fill_hex = ramp[stage_idx]
-            stage_fill = NA_FILL if not applicable else PatternFill(fill_type="solid", fgColor=fill_hex)
-            stage_font = NA_FONT if not applicable else Font(name=FONT_BODY, bold=True,
-                                                               color=readable_text_color(fill_hex))
+    for stage_idx, stage_label in enumerate(STAGE_LABELS):
+        if not funnel["applicable"][stage_idx]:
+            continue
+        stage_start_col = col
+        fill_hex = ramp[stage_idx]
+        stage_fill = PatternFill(fill_type="solid", fgColor=fill_hex)
+        stage_font = Font(name=FONT_BODY, bold=True, color=readable_text_color(fill_hex))
 
-            for month in months:
-                for week in month.weeks:
-                    for day_col in week.days:
-                        c = stage_start_col + day_col.col - 1
-                        _write_time_header(ws, c, MONO_FONT, day_col.day.isoformat())
-                        ws.column_dimensions[get_column_letter(c)].outline_level = 2
-                        ws.column_dimensions[get_column_letter(c)].hidden = True
-                        if applicable and day_col.has_data:
-                            _write_day_value(ws, numbered_rows, child_rows, leaf_counts, computed,
-                                              fname, stage_idx, c, day_col.day, formula_cells)
-                        elif not applicable:
-                            _write_na(ws, numbered_rows, c)
-                    wc = stage_start_col + week.col - 1
-                    _write_time_header(ws, wc, MONO_FONT, week.label)
-                    ws.column_dimensions[get_column_letter(wc)].outline_level = 1
-                    ws.column_dimensions[get_column_letter(wc)].hidden = True
-                    ws.column_dimensions[get_column_letter(wc)].collapsed = True
-                    if applicable:
-                        first_day_c = stage_start_col + week.days[0].col - 1
-                        last_day_c = stage_start_col + week.days[-1].col - 1
-                        _write_week_or_month_total(ws, numbered_rows, computed, fname, stage_idx,
-                                                    first_day_c, last_day_c, wc, formula_cells,
-                                                    bucket_key=("week", (month.idx, week.label)))
-                    else:
-                        _write_na(ws, numbered_rows, wc)
-                mc = stage_start_col + month.col - 1
-                _write_time_header(ws, mc, BOLD_BODY_FONT, month.name)
-                ws.column_dimensions[get_column_letter(mc)].outline_level = 0
-                ws.column_dimensions[get_column_letter(mc)].collapsed = True
-                if applicable:
-                    week_total_cols = [stage_start_col + wk.col - 1 for wk in month.weeks]
-                    _write_week_or_month_total(ws, numbered_rows, computed, fname, stage_idx,
-                                                None, None, mc, formula_cells,
-                                                explicit_cols=week_total_cols,
-                                                bucket_key=("month", month.idx))
-                else:
-                    _write_na(ws, numbered_rows, mc)
+        for month in months:
+            for week in month.weeks:
+                for day_col in week.days:
+                    c = stage_start_col + day_col.col - 1
+                    _write_time_header(ws, c, MONO_FONT, day_col.day.isoformat())
+                    ws.column_dimensions[get_column_letter(c)].outline_level = 2
+                    ws.column_dimensions[get_column_letter(c)].hidden = True
+                    if day_col.has_data:
+                        _write_day_value(ws, numbered_rows, child_rows, leaf_counts, computed,
+                                          fname, stage_idx, c, day_col.day, formula_cells)
+                wc = stage_start_col + week.col - 1
+                _write_time_header(ws, wc, MONO_FONT, week.label)
+                ws.column_dimensions[get_column_letter(wc)].outline_level = 1
+                ws.column_dimensions[get_column_letter(wc)].hidden = True
+                ws.column_dimensions[get_column_letter(wc)].collapsed = True
+                first_day_c = stage_start_col + week.days[0].col - 1
+                last_day_c = stage_start_col + week.days[-1].col - 1
+                _write_week_or_month_total(ws, numbered_rows, computed, fname, stage_idx,
+                                            first_day_c, last_day_c, wc, formula_cells,
+                                            bucket_key=("week", (month.idx, week.label)))
+            mc = stage_start_col + month.col - 1
+            _write_time_header(ws, mc, BOLD_BODY_FONT, month.name)
+            ws.column_dimensions[get_column_letter(mc)].outline_level = 0
+            ws.column_dimensions[get_column_letter(mc)].collapsed = True
+            week_total_cols = [stage_start_col + wk.col - 1 for wk in month.weeks]
+            _write_week_or_month_total(ws, numbered_rows, computed, fname, stage_idx,
+                                        None, None, mc, formula_cells,
+                                        explicit_cols=week_total_cols,
+                                        bucket_key=("month", month.idx))
 
-            stage_end_col = stage_start_col + group_width - 1
-            ws.merge_cells(start_row=2, start_column=stage_start_col, end_row=2, end_column=stage_end_col)
-            stage_cell = ws.cell(row=2, column=stage_start_col,
-                                  value=stage_label if applicable else f"{stage_label} (N/A)")
-            for c in range(stage_start_col, stage_end_col + 1):
-                cell2 = ws.cell(row=2, column=c)
-                cell2.fill = stage_fill
-                cell2.font = stage_font
-                cell2.border = THIN_BORDER
-                cell2.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-
-            col = stage_end_col + 1
-            total_data_cols += group_width
-
-        funnel_end_col = col - 1
-        funnel_start_col = funnel_end_col - 6 * group_width + 1
-        ws.merge_cells(start_row=1, start_column=funnel_start_col, end_row=1, end_column=funnel_end_col)
-        funnel_cell = ws.cell(row=1, column=funnel_start_col, value=f"Funnel: {fname}")
-        for c in range(funnel_start_col, funnel_end_col + 1):
+        stage_end_col = stage_start_col + group_width - 1
+        ws.merge_cells(start_row=1, start_column=stage_start_col, end_row=1, end_column=stage_end_col)
+        ws.cell(row=1, column=stage_start_col, value=stage_label)
+        for c in range(stage_start_col, stage_end_col + 1):
             cell1 = ws.cell(row=1, column=c)
-            cell1.fill = PatternFill(fill_type="solid", fgColor=funnel["base_color"])
-            cell1.font = Font(name=FONT_BODY, bold=True, color=readable_text_color(funnel["base_color"]))
+            cell1.fill = stage_fill
+            cell1.font = stage_font
             cell1.border = THIN_BORDER
             cell1.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+
+        col = stage_end_col + 1
+        total_data_cols += group_width
 
     last_col = col - 1
     for c in range(LABEL_COL + 1, last_col + 1):
@@ -1092,18 +1085,10 @@ def _build_funnel_sheet(wb, rows, leaf_counts, computed, ref, run_date, months, 
 
 
 def _write_time_header(ws, col, font, value):
-    cell = ws.cell(row=3, column=col, value=value)
+    cell = ws.cell(row=2, column=col, value=value)  # row 2: the time-label header row
     cell.font = font
     cell.border = THIN_BORDER
     cell.alignment = Alignment(horizontal="center")
-
-
-def _write_na(ws, numbered_rows, col):
-    for row in numbered_rows:
-        cell = ws.cell(row=row["row_num"], column=col, value="N/A")
-        cell.font = NA_FONT
-        cell.border = THIN_BORDER
-        cell.alignment = Alignment(horizontal="center")
 
 
 def _row_key(row):
@@ -1226,7 +1211,8 @@ def recompute_all_cells(rows, leaf_counts, ref, run_date) -> dict:
 
 
 # =========================================================================
-# Sheet 2: Filters & Definitions
+# Funnel/stage descriptions -- printed by QA check 4, not written to any
+# sheet (the "Filters & Definitions" tab was dropped; see README).
 # =========================================================================
 
 FUNNEL_STAGE_DESCRIPTIONS = {
@@ -1249,117 +1235,6 @@ FUNNEL_STAGE_DESCRIPTIONS = {
     ("Existing Deals", "Proposals Sent"): "same base AND pipeline = Sales AND Proposal Sent Date Time falls in this period",
     ("Existing Deals", "Proposal Signed"): "same base AND pipeline = Sales AND Proposal Signed Date Time falls in this period",
 }
-
-
-def _write_section_title(ws, row, text):
-    cell = ws.cell(row=row, column=1, value=text)
-    cell.font = SECTION_TITLE_FONT
-    return row + 1
-
-
-def _build_filters_sheet(wb, ref: ReferenceData, filter_steps, run_date, months):
-    ws = wb.create_sheet("Filters & Definitions")
-    ws.column_dimensions["A"].width = 42
-    ws.column_dimensions["B"].width = 70
-    r = 1
-
-    title = ws.cell(row=r, column=1, value="Filters & Definitions")
-    title.font = TITLE_FONT
-    r += 2
-
-    r = _write_section_title(ws, r, "Resolved properties, pipelines and stage ids")
-    resolved_pairs = [
-        ("Original Traffic Source", ref.source_prop),
-        ("Original Traffic Source Drill-Down 1", ref.dd1_prop),
-        ("Original Traffic Source Drill-Down 2", ref.dd2_prop),
-        ("Contact Type", ref.contact_type_prop),
-        ("Brand", ref.brand_prop),
-        ("Brand Domain", ref.brand_domain_prop),
-        ("Lead Source", ref.lead_source_prop),
-        ("Sales pipeline id", f"{ref.sales_pipeline_id} ({ref.sales_pipeline_label})"),
-        ("SQL Lost Reason", ref.sql_lost_prop),
-        ("Owner Assigned Date", ref.owner_assigneddate_prop),
-        ("Closed Lost stage id", ref.closedlost_stage_id),
-        ("Closed Lost date-entered property", ref.closedlost_date_entered_prop),
-        ("Proposal Sent Date Time", ref.proposal_sent_prop),
-        ("Proposal Signed Date Time", ref.proposal_signed_prop),
-    ]
-    for label, value in resolved_pairs:
-        ws.cell(row=r, column=1, value=label).font = BOLD_BODY_FONT
-        ws.cell(row=r, column=2, value=str(value)).font = BODY_FONT
-        r += 1
-    r += 1
-    if ref.flags:
-        r = _write_section_title(ws, r, "Discrepancies flagged during Step 0")
-        for flag in ref.flags:
-            ws.cell(row=r, column=1, value=flag).font = MUTED_ITALIC_FONT
-            ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=2)
-            r += 1
-        r += 1
-
-    r = _write_section_title(ws, r, "Overall filters (applied to every row and cell)")
-    overall_filter_text = [
-        "1. Contact Type is none of 'B2B Partnership Development', 'B2B Institutional Relations' (blanks pass).",
-        "2. Lead Source is none of Bundle Offer/Other/Instantly/Private/Walk-In/Email/Partner Referral/"
-        "Phone Calls/Events/Client Referral (blanks pass).",
-        f"3. Brand includes '{ref.brand_required_value}' (blanks FAIL this filter).",
-        "4. Brand Domain is none of 'BePortugal' (blanks pass).",
-    ]
-    for line in overall_filter_text:
-        ws.cell(row=r, column=1, value=line).font = BODY_FONT
-        ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=2)
-        r += 1
-    r += 1
-
-    r = _write_section_title(ws, r, "Filter audit trail (contacts remaining after each filter)")
-    ws.cell(row=r, column=1, value="Step").font = HEADER_FONT
-    ws.cell(row=r, column=2, value="Contacts remaining").font = HEADER_FONT
-    for c in (1, 2):
-        ws.cell(row=r, column=c).fill = HEADER_FILL
-    r += 1
-    for step in filter_steps:
-        ws.cell(row=r, column=1, value=step.description).font = BODY_FONT
-        ws.cell(row=r, column=2, value=step.count_after).font = BODY_FONT
-        r += 1
-    r += 1
-
-    r = _write_section_title(ws, r, "Funnel / Stage definitions")
-    ws.cell(row=r, column=1, value="Funnel x Stage").font = HEADER_FONT
-    ws.cell(row=r, column=2, value="Filter applied").font = HEADER_FONT
-    for c in (1, 2):
-        ws.cell(row=r, column=c).fill = HEADER_FILL
-    r += 1
-    for funnel in FUNNELS:
-        for stage_label in STAGE_LABELS:
-            desc = FUNNEL_STAGE_DESCRIPTIONS[(funnel["name"], stage_label)]
-            ws.cell(row=r, column=1, value=f"{funnel['name']} / {stage_label}").font = BODY_FONT
-            ws.cell(row=r, column=2, value=desc).font = BODY_FONT
-            r += 1
-    r += 1
-
-    r = _write_section_title(ws, r, "Run metadata")
-    in_progress_month = next((m for m in months if not m.is_complete and any(w.days for w in m.weeks)), None)
-    in_progress_week = None
-    if in_progress_month:
-        for w in in_progress_month.weeks:
-            if not w.is_complete:
-                in_progress_week = w
-    ws.cell(row=r, column=1, value="Run timestamp (UTC)").font = BOLD_BODY_FONT
-    ws.cell(row=r, column=2, value=datetime.now(timezone.utc).isoformat()).font = MONO_FONT
-    r += 1
-    ws.cell(row=r, column=1, value="Report year").font = BOLD_BODY_FONT
-    ws.cell(row=r, column=2, value=str(run_date.year)).font = BODY_FONT
-    r += 1
-    ws.cell(row=r, column=1, value="In-progress month").font = BOLD_BODY_FONT
-    ws.cell(row=r, column=2, value=in_progress_month.name if in_progress_month else "none").font = BODY_FONT
-    r += 1
-    ws.cell(row=r, column=1, value="In-progress week").font = BOLD_BODY_FONT
-    ws.cell(row=r, column=2,
-            value=f"{in_progress_week.label} {in_progress_month.name}" if in_progress_week else "none").font = BODY_FONT
-    r += 1
-    ws.cell(row=r, column=1, value="Months treated as finished").font = BOLD_BODY_FONT
-    finished = [m.name for m in months if m.is_complete]
-    ws.cell(row=r, column=2, value=", ".join(finished) if finished else "none").font = BODY_FONT
 
 
 # =========================================================================
@@ -1449,7 +1324,7 @@ def recalculate_workbook(xlsx_path: str, sheet_cell_values: dict) -> None:
 # =========================================================================
 
 
-def run_qa(rows, leaf_counts, ref, run_date, filtered_contacts, all_contacts, filter_steps, total_cols) -> bool:
+def run_qa(rows, leaf_counts, ref, run_date, filtered_contacts, all_contacts, filter_steps, sheet_col_counts) -> bool:
     print("=== QA ===")
     computed = recompute_all_cells(rows, leaf_counts, ref, run_date)
     all_pass = True
@@ -1588,11 +1463,16 @@ def run_qa(rows, leaf_counts, ref, run_date, filtered_contacts, all_contacts, fi
     for d in check5_detail:
         print(f"      - {d}")
 
-    # --- QA 6: column count sanity check
-    check6_pass = total_cols is not None and (total_cols + 1) < 16384
+    # --- QA 6: column count sanity check (per sheet -- Excel's 16,384
+    # limit applies to each sheet individually, and there are now 3)
+    check6_pass = True
+    for sheet_name, data_cols in sheet_col_counts.items():
+        sheet_total = data_cols + 1  # + the label column
+        sheet_ok = sheet_total < 16384
+        check6_pass &= sheet_ok
+        print(f"  [6] Column count sanity check ({sheet_name}): {'PASS' if sheet_ok else 'FAIL'} "
+              f"(total columns = {sheet_total}, limit = 16384)")
     all_pass &= check6_pass
-    print(f"  [6] Column count sanity check: {'PASS' if check6_pass else 'FAIL'} "
-          f"(total columns = {total_cols + 1}, limit = 16384)")
 
     print(f"=== QA {'PASSED' if all_pass else 'FAILED'} ===\n")
     return all_pass
@@ -1632,13 +1512,14 @@ def main() -> int:
 
         os.makedirs(os.path.dirname(OUTPUT_PATH), exist_ok=True)
         print("Building workbook...")
-        wb, sheet_cell_values, total_cols = build_workbook(rows, leaf_counts, ref, run_date, filter_steps)
+        wb, sheet_cell_values, sheet_col_counts = build_workbook(rows, leaf_counts, ref, run_date)
         wb.save(OUTPUT_PATH)
 
         print("Recalculating formulas...")
         recalculate_workbook(OUTPUT_PATH, sheet_cell_values)
 
-        qa_passed = run_qa(rows, leaf_counts, ref, run_date, filtered_contacts, all_contacts, filter_steps, total_cols)
+        qa_passed = run_qa(rows, leaf_counts, ref, run_date, filtered_contacts, all_contacts, filter_steps,
+                            sheet_col_counts)
 
         print(f"Wrote {OUTPUT_PATH}")
         if not qa_passed:

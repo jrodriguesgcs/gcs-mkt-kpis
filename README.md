@@ -1,22 +1,27 @@
 # HubSpot Traffic-Source Funnel Report
 
 Fetches every HubSpot contact and its associated deals, applies four
-portal-wide filters, and writes a single styled `.xlsx` to
-`reports/funnel_report.xlsx`:
+portal-wide filters, and writes a styled `.xlsx` to
+`reports/funnel_report.xlsx` with **one sheet per funnel**: "New
+Contacts", "New Deals", "Existing Deals".
 
-- **Funnel Report** — rows are **Original Traffic Source**, 3 levels deep
-  (Source → Drill-Down 1 → Drill-Down 2). Columns are
-  **Funnel** (New Contacts / New Deals / Existing Deals) × **Stage** (6
-  stages each, 18 total) × **Time** (Month → Week → Day, full calendar
-  year). Both axes use Excel's native **Group & Outline** (+/- buttons) —
-  clicking + on a row expands its next drill-down level; clicking + on a
-  Month column reveals its Weeks, and on a Week reveals its Days. Every
-  rollup (row and time) is a real `=SUM()` formula referencing its
-  children, so collapsing anything never changes a visible total.
-- **Filters & Definitions** — a static reference sheet: every resolved
-  property/pipeline/stage id, the four overall filters as applied, the
-  funnel/stage definition table, the filter audit trail, and which
-  months/weeks this run treated as in-progress vs. finished.
+On each sheet, rows are **Original Traffic Source**, 3 levels deep
+(Source → Drill-Down 1 → Drill-Down 2). Columns are that funnel's own
+applicable **Stage**s (a stage that doesn't apply to a given funnel — e.g.
+"New Contacts" on the Existing Deals sheet — is simply omitted, not
+placeholder-filled) × **Time** (Month → Week → Day, full calendar year).
+Both axes use Excel's native **Group & Outline** (+/- buttons) — clicking
++ on a row expands exactly its next drill-down level (never two at once);
+clicking + on a Month column reveals its Weeks, and on a Week reveals its
+Days. Every rollup (row and time) is a real `=SUM()` formula referencing
+its children, so collapsing anything never changes a visible total. Every
+row and column starts fully collapsed to its coarsest level (Source;
+Month) when the file is opened.
+
+There's no separate "Filters & Definitions" sheet — Step 0's resolved
+properties, the filter audit trail, and the funnel/stage definitions are
+still printed to the console on every run (see below), they just aren't
+duplicated into the workbook.
 
 Run with: `python generate_funnel_report.py`
 
@@ -119,22 +124,17 @@ portal changes again.
 
 ## What's in the workbook
 
-**Funnel Report**: column A holds the row label at whichever hierarchy
-level is visible (indented per level). Row 1 is the Funnel band, row 2 the
-Stage band, row 3 the Month/Week (`W1`, `W2`, ...) or Day (`YYYY-MM-DD`)
-label. Each of the 18 stage-columns is colored from a 6-step HSL ramp
-derived from its funnel's brand colour (Night Blue / Electric Blue /
-Slate), lightest at "New Contacts" and darkest at "Proposal Signed" —
-header text switches to white automatically once the background gets dark
-enough to need it. The 6 combinations the spec marks not applicable (e.g.
-"New Contacts" stage under the "New Deals" funnel) still get the full
-Month→Week→Day column structure, just filled with the literal text `N/A`
-in a neutral grey instead of a ramp colour. Numeric data cells themselves
-stay plain white/neutral, per the "flat fills, sharp corners" rule —
-color only ever marks a header band.
-
-**Filters & Definitions**: static text, generated once per run — not a
-live pivot, so it reads correctly even if reopened without recalculating.
+Each of the 3 sheets (New Contacts / New Deals / Existing Deals) has the
+same layout: column A holds the row label at whichever hierarchy level is
+visible (indented per level). Row 1 is the Stage band, row 2 the
+Month/Week (`W1`, `W2`, ...) or Day (`YYYY-MM-DD`) label. Each stage
+column is colored from a 6-step HSL ramp derived from that funnel's brand
+colour (New Contacts → Night Blue, New Deals → Electric Blue, Existing
+Deals → Slate), lightest at that sheet's first stage and darkest at
+"Proposal Signed" — header text switches to white automatically once the
+background gets dark enough to need it. Numeric data cells themselves
+stay plain white/neutral, per the "flat fills, sharp corners" rule — color
+only ever marks a header band.
 
 ## QA
 
@@ -157,9 +157,10 @@ Printed on every run, per the spec's required checks:
 5. **To-date vs. completed logic** — prints which month/week this run
    treated as in-progress, and confirms only elapsed days/weeks were
    marked as having data.
-6. **Column count sanity check** — prints the final column count and
-   confirms it's comfortably under Excel's 16,384-column limit (typically
-   ~7,900: 18 stage-groups × ~440 time columns each).
+6. **Column count sanity check** — prints each sheet's column count and
+   confirms it's comfortably under Excel's 16,384-column-per-sheet limit
+   (typically ~2,600 for New Contacts, ~2,200 for New Deals, ~1,800 for
+   Existing Deals — applicable stages × ~440 time columns each).
 
 A failing check is described with the specific row/column/date needed to
 debug it, not just "mismatch found".
