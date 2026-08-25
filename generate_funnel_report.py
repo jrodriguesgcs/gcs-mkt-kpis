@@ -14,7 +14,8 @@ reports/funnel_report.xlsx with one sheet per funnel -- "New Contacts",
   -> Drill-Down 2). Columns are that funnel's own applicable Stages (a
   stage that doesn't apply to a given funnel is simply omitted from that
   funnel's sheet, not placeholder-filled) x Time (Month -> Week -> Day,
-  full calendar year). Both axes use Excel's native Group & Outline (+/-
+  year-to-date -- January through the current month, not the full
+  calendar year). Both axes use Excel's native Group & Outline (+/-
   buttons) so a viewer can expand or collapse either hierarchy one level
   at a time without touching a pivot table -- every row and column starts
   fully collapsed to its coarsest level (Source; Month) when the file is
@@ -118,11 +119,13 @@ STAGE_LABELS = ["New Contacts", "New Deals", "Qualified Deals",
                 "Opportunities", "Proposals Sent", "Proposal Signed"]
 
 FUNNELS = [
-    {"name": "New Contacts", "base_color": NIGHT_BLUE,
+    # All 3 sheets share the same colour pattern (the "New Deals"/Electric
+    # Blue ramp) per request -- base_color is uniform, not per-funnel.
+    {"name": "New Contacts", "base_color": ELECTRIC_BLUE,
      "applicable": [True, True, True, True, True, True]},
     {"name": "New Deals", "base_color": ELECTRIC_BLUE,
      "applicable": [False, True, True, True, True, True]},
-    {"name": "Existing Deals", "base_color": SLATE,
+    {"name": "Existing Deals", "base_color": ELECTRIC_BLUE,
      "applicable": [False, False, True, True, True, True]},
 ]
 
@@ -299,9 +302,20 @@ class HubSpotClient:
         body = dict(body)
         body.setdefault("limit", 100)
         results = []
+        first_page = True
         while True:
             data = self.post(f"/crm/v3/objects/{object_type}/search", is_search=True, json=body)
             results.extend(data.get("results", []))
+            if label and first_page:
+                # Diagnostic: HubSpot's own reported match count for these
+                # filters, independent of how many pages we go on to fetch.
+                # If this differs wildly from the final fetched count for
+                # reasons other than the 10k cap below, that points at the
+                # credential's data visibility, not the filter logic.
+                reported_total = data.get("total")
+                if reported_total is not None:
+                    print(f"\n  HubSpot reports {reported_total:,} {label} total match these filters.")
+                first_page = False
             if label:
                 _print_progress(f"{label} fetched so far", len(results))
             if len(results) >= 10000:
@@ -934,7 +948,7 @@ def compute_leaf_counts(rows: list[dict], ref: ReferenceData) -> dict:
 
 
 # =========================================================================
-# Time-column layout (Month -> Week -> Day, full calendar year, identical
+# Time-column layout (Month -> Week -> Day, year-to-date, identical
 # shape for every one of the 18 stage-groups)
 # =========================================================================
 
@@ -964,10 +978,14 @@ class MonthCol:
 
 
 def build_time_layout(run_date: date) -> tuple[list, int]:
+    """Year-to-date only: January through the current month (run_date's
+    month), not the full calendar year -- a month after run_date simply
+    isn't rendered as a column at all, rather than existing with entirely
+    blank cells."""
     year = run_date.year
     months: list = []
     col = 1  # 1-based, relative to the start of a stage-group's column block
-    for month_idx in range(1, 13):
+    for month_idx in range(1, run_date.month + 1):
         first = date(year, month_idx, 1)
         last = month_end_exclusive(first) - timedelta(days=1)
         is_month_complete = last < month_start(run_date) if run_date.year == year else True
@@ -1127,7 +1145,12 @@ def _build_single_funnel_sheet(ws, funnel, rows, leaf_counts, computed, run_date
         stage_start_col = col
         fill_hex = ramp[stage_idx]
         stage_fill = PatternFill(fill_type="solid", fgColor=fill_hex)
-        stage_font = Font(name=FONT_BODY, bold=True, color=readable_text_color(fill_hex))
+        # Qualified Deals' ramp step computes as light enough (>~55%) for
+        # readable_text_color() to pick Night Blue text automatically, but
+        # against the Electric Blue hue specifically that's still hard to
+        # read -- forced to white here per request.
+        text_color = "FFFFFF" if stage_label == "Qualified Deals" else readable_text_color(fill_hex)
+        stage_font = Font(name=FONT_BODY, bold=True, color=text_color)
 
         for month in months:
             for week in month.weeks:

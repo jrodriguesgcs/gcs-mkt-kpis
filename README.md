@@ -9,7 +9,8 @@ On each sheet, rows are **Original Traffic Source**, 3 levels deep
 (Source → Drill-Down 1 → Drill-Down 2). Columns are that funnel's own
 applicable **Stage**s (a stage that doesn't apply to a given funnel — e.g.
 "New Contacts" on the Existing Deals sheet — is simply omitted, not
-placeholder-filled) × **Time** (Month → Week → Day, full calendar year).
+placeholder-filled) × **Time** (Month → Week → Day, **year-to-date** —
+January through the current month only, not the full calendar year).
 Both axes use Excel's native **Group & Outline** (+/- buttons) — clicking
 + on a row expands exactly its next drill-down level (never two at once);
 clicking + on a Month column reveals its Weeks, and on a Week reveals its
@@ -122,10 +123,18 @@ portal changes again.
   grain. This is what guarantees a Month total always equals the sum of
   its Weeks, and a Week total always equals the sum of its Days (verified
   by QA check 1/2 for every row, not just a sample).
-- **Full calendar year of columns, all 12 months**, even future ones —
-  a not-yet-elapsed day's cell is left blank (not zero); Week/Month
-  totals still exist as real columns and sum whatever elapsed data
-  exists beneath them.
+- **Year-to-date columns only** — January through the current month; a
+  month after the current one isn't rendered as a column at all. Within
+  the current (in-progress) month, a not-yet-elapsed day's cell is left
+  blank (not zero); Week/Month totals still exist as real columns and sum
+  whatever elapsed data exists beneath them.
+- **All 3 sheets share one colour pattern** (the Electric Blue ramp,
+  i.e. what was previously just "New Deals"'s colour) rather than each
+  funnel having its own base colour — a viewer sees the same header
+  colours on every tab. "Qualified Deals" text is forced to white on
+  this ramp regardless of the computed lightness threshold, since Night
+  Blue text reads poorly against that particular step of the Electric
+  Blue ramp.
 
 ## What's in the workbook
 
@@ -133,11 +142,11 @@ Each of the 3 sheets (New Contacts / New Deals / Existing Deals) has the
 same layout: column A holds the row label at whichever hierarchy level is
 visible (indented per level). Row 1 is the Stage band, row 2 the
 Month/Week (`W1`, `W2`, ...) or Day (`YYYY-MM-DD`) label. Each stage
-column is colored from a 6-step HSL ramp derived from that funnel's brand
-colour (New Contacts → Night Blue, New Deals → Electric Blue, Existing
-Deals → Slate), lightest at that sheet's first stage and darkest at
-"Proposal Signed" — header text switches to white automatically once the
-background gets dark enough to need it. Numeric data cells themselves
+column is colored from the same 6-step Electric Blue HSL ramp on every
+sheet, lightest at that sheet's first stage and darkest at "Proposal
+Signed" — header text switches to white automatically once the
+background gets dark enough to need it, except "Qualified Deals" which
+is always white (see above). Numeric data cells themselves
 stay plain white/neutral, per the "flat fills, sharp corners" rule — color
 only ever marks a header band.
 
